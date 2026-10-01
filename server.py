@@ -26,7 +26,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 ROOT_DIR = Path(__file__).parent
 
 # MongoDB connection settings
-mongo_url = os.getenv('MONGO_URL', 'mongodb://localhost:27017/sixthsense')
+mongo_url = (
+    os.getenv('MONGO_URL') or 
+    os.getenv('MONGODB_URI') or 
+    os.getenv('MONGO_URI') or 
+    os.getenv('DATABASE_URL') or 
+    'mongodb://localhost:27017/sixthsense'
+)
 db_name = os.getenv('DB_NAME', 'sixthsense')
 
 # Initialize MongoDB client with connection pool bounds (BE-017)
