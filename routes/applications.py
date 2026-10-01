@@ -1,11 +1,14 @@
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from typing import List, Optional
 from datetime import datetime
-import uuid
 import sys
 import os
-import aiofiles
+import uuid
 from pathlib import Path
+try:
+    import aiofiles
+except ImportError:
+    aiofiles = None
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.application import (
@@ -166,9 +169,13 @@ The Psychic Advisor Team
         file_path = upload_dir / unique_filename
         
         # Save the file
-        async with aiofiles.open(file_path, 'wb') as out_file:
-            content = await file.read()
-            await out_file.write(content)
+        content = await file.read()
+        if aiofiles:
+            async with aiofiles.open(file_path, 'wb') as out_file:
+                await out_file.write(content)
+        else:
+            with open(file_path, 'wb') as out_file:
+                out_file.write(content)
         
         # Return a URL to access the video
         video_url = f"/api/applications/video/{unique_filename}"
