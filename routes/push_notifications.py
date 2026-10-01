@@ -39,12 +39,18 @@ try:
                 logger.warning(f"Failed to parse Firebase credentials from env: {env_err}")
 
         # Check local JSON file if not initialized from env
-        if not FIREBASE_INITIALIZED and os.path.exists(FIREBASE_CREDENTIALS_PATH):
-            cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
+        firebase_file = None
+        for p in [FIREBASE_CREDENTIALS_PATH, os.path.join(os.getcwd(), 'firebase-service-account.json'), '/app/firebase-service-account.json']:
+            if os.path.exists(p):
+                firebase_file = p
+                break
+
+        if not FIREBASE_INITIALIZED and firebase_file:
+            cred = credentials.Certificate(firebase_file)
             firebase_admin.initialize_app(cred)
             FIREBASE_INITIALIZED = True
             FIREBASE_ENABLED = True
-            logger.info("✅ Firebase Admin SDK initialized successfully from file")
+            logger.info(f"✅ Firebase Admin SDK initialized successfully from file: {firebase_file}")
             
         if not FIREBASE_INITIALIZED:
             logger.warning(f"Firebase credentials not found at {FIREBASE_CREDENTIALS_PATH} or in env")

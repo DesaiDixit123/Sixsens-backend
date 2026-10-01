@@ -30,7 +30,6 @@ venv_win/
 ENV/
 
 # Secrets & Credentials
-firebase-service-account.json
 *.pem
 *.key
 *.keystore
