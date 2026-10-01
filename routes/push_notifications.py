@@ -17,23 +17,37 @@ FIREBASE_ENABLED = False  # Alias for FIREBASE_INITIALIZED
 try:
     import firebase_admin
     from firebase_admin import credentials, messaging
+    import json
     
-    if os.path.exists(FIREBASE_CREDENTIALS_PATH):
-        # Check if already initialized (to avoid multiple initializations)
-        try:
-            firebase_admin.get_app()
-            FIREBASE_INITIALIZED = True
-            FIREBASE_ENABLED = True
-            logger.info("✅ Firebase Admin SDK already initialized")
-        except ValueError:
-            # Not initialized, initialize now
+    try:
+        firebase_admin.get_app()
+        FIREBASE_INITIALIZED = True
+        FIREBASE_ENABLED = True
+        logger.info("✅ Firebase Admin SDK already initialized")
+    except ValueError:
+        # Check environment variable first (for Railway/Cloud deployments)
+        firebase_env = os.getenv("FIREBASE_SERVICE_ACCOUNT") or os.getenv("FIREBASE_CREDENTIALS")
+        if firebase_env:
+            try:
+                cred_dict = json.loads(firebase_env)
+                cred = credentials.Certificate(cred_dict)
+                firebase_admin.initialize_app(cred)
+                FIREBASE_INITIALIZED = True
+                FIREBASE_ENABLED = True
+                logger.info("✅ Firebase Admin SDK initialized from environment variable")
+            except Exception as env_err:
+                logger.warning(f"Failed to parse Firebase credentials from env: {env_err}")
+
+        # Check local JSON file if not initialized from env
+        if not FIREBASE_INITIALIZED and os.path.exists(FIREBASE_CREDENTIALS_PATH):
             cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
             firebase_admin.initialize_app(cred)
             FIREBASE_INITIALIZED = True
             FIREBASE_ENABLED = True
-            logger.info("✅ Firebase Admin SDK initialized successfully")
-    else:
-        logger.warning(f"Firebase credentials not found at {FIREBASE_CREDENTIALS_PATH}")
+            logger.info("✅ Firebase Admin SDK initialized successfully from file")
+            
+        if not FIREBASE_INITIALIZED:
+            logger.warning(f"Firebase credentials not found at {FIREBASE_CREDENTIALS_PATH} or in env")
 except Exception as e:
     logger.warning(f"Firebase Admin SDK not initialized: {e}")
 

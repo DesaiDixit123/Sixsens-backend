@@ -20,15 +20,27 @@ FIREBASE_INITIALIZED = False
 try:
     import firebase_admin
     from firebase_admin import credentials, messaging
+    import json
     
-    FIREBASE_CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), '..', 'firebase-service-account.json')
-    if os.path.exists(FIREBASE_CREDENTIALS_PATH):
-        try:
-            firebase_admin.get_app()
-            FIREBASE_INITIALIZED = True
-        except ValueError:
-            pass
-        if not FIREBASE_INITIALIZED:
+    try:
+        firebase_admin.get_app()
+        FIREBASE_INITIALIZED = True
+    except ValueError:
+        pass
+
+    if not FIREBASE_INITIALIZED:
+        firebase_env = os.getenv("FIREBASE_SERVICE_ACCOUNT") or os.getenv("FIREBASE_CREDENTIALS")
+        if firebase_env:
+            try:
+                cred = credentials.Certificate(json.loads(firebase_env))
+                firebase_admin.initialize_app(cred)
+                FIREBASE_INITIALIZED = True
+            except:
+                pass
+
+    if not FIREBASE_INITIALIZED:
+        FIREBASE_CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), '..', 'firebase-service-account.json')
+        if os.path.exists(FIREBASE_CREDENTIALS_PATH):
             try:
                 cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
                 firebase_admin.initialize_app(cred)
