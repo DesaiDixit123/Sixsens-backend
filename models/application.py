@@ -21,11 +21,18 @@ class PsychicApplication(BaseModel):
     # Tax info stored as reference (actual tax docs handled separately)
     tax_form_type: str  # 'w9' or 'w8ben'
     tax_form_completed: bool = False
-    # Payment
-    paypal_email: str
-    # Video
+    # Payment & Bank info
+    paypal_email: Optional[str] = None
+    bank_name: Optional[str] = None
+    account_number: Optional[str] = None
+    routing_number: Optional[str] = None
+    password_hash: Optional[str] = None
+    # Video & Interview
     video_url: Optional[str] = None
     video_duration: Optional[int] = None  # in seconds
+    intro_video_url: Optional[str] = None
+    intro_video_duration: Optional[int] = None
+    interview_answers: Optional[List[dict]] = None
     # Status
     status: str = "pending"  # pending, under_review, accepted, rejected
     rejection_reason: Optional[str] = None
@@ -46,11 +53,18 @@ class ApplicationCreate(BaseModel):
     bio: str
     background: str
     tools_used: List[str] = []
-    tax_form_type: str
+    tax_form_type: str = "w9"
     tax_form_completed: bool = False
-    paypal_email: str
+    paypal_email: Optional[str] = None
+    bank_name: Optional[str] = None
+    account_number: Optional[str] = None
+    routing_number: Optional[str] = None
+    password: Optional[str] = None
     video_url: Optional[str] = None
     video_duration: Optional[int] = None
+    intro_video_url: Optional[str] = None
+    intro_video_duration: Optional[int] = None
+    interview_answers: Optional[List[dict]] = None
 
 class ApplicationResponse(BaseModel):
     id: str
@@ -64,13 +78,19 @@ class ApplicationResponse(BaseModel):
     bio: str
     background: str
     tools_used: List[str]
-    tax_form_type: str
-    paypal_email: str
-    video_url: Optional[str]
-    video_duration: Optional[int]
+    tax_form_type: Optional[str] = "w9"
+    paypal_email: Optional[str] = None
+    bank_name: Optional[str] = None
+    account_number: Optional[str] = None
+    routing_number: Optional[str] = None
+    video_url: Optional[str] = None
+    video_duration: Optional[int] = None
+    intro_video_url: Optional[str] = None
+    intro_video_duration: Optional[int] = None
+    interview_answers: Optional[List[dict]] = None
     status: str
-    rejection_reason: Optional[str]
-    reviewed_at: Optional[datetime]
+    rejection_reason: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
     created_at: datetime
 
 class ApplicationStatusUpdate(BaseModel):

@@ -31,6 +31,8 @@ class ChatSession(BaseModel):
     auto_end_minutes: int = 0  # Auto-end after X minutes (0 = no limit)
 
 class ChatSessionCreate(BaseModel):
+    client_id: Optional[str] = None
+    client_name: Optional[str] = None
     psychic_id: str
     session_type: str = "chat"
     initial_minutes: int = 5  # Pre-purchased minutes

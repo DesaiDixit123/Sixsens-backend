@@ -355,26 +355,35 @@ def create_admin_routes(db):
             raise HTTPException(status_code=404, detail="Application not found")
         
         # Create psychic profile
+        password_hash = app.get("password_hash")
         new_psychic = {
             "id": f"psy-{str(uuid.uuid4())[:8]}",
             "name": app.get("full_name") or app.get("name"),
             "email": app.get("email"),
             "description": app.get("bio"),
             "specialties": app.get("specialties", []),
-            "reading_methods": app.get("reading_methods", ["chat", "phone", "video"]),
+            "reading_methods": ["chat"],
             "chat_rate": app.get("chat_rate", 2.99),
-            "phone_rate": app.get("phone_rate", 3.99),
-            "video_rate": app.get("video_rate", 4.99),
+            "bank_name": app.get("bank_name"),
+            "account_number": app.get("account_number"),
+            "routing_number": app.get("routing_number"),
+            "password_hash": password_hash,
             "online_status": "offline",
             "status": "approved",
+            "is_active": True,
             "average_rating": 0,
             "total_readings": 0,
             "total_reviews": 0,
             "total_earnings": 0,
             "profile_picture": app.get("profile_picture") or "https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=400",
             "offers_chat": True,
-            "offers_phone": True,
-            "offers_video": True,
+            "offers_phone": False,
+            "offers_video": False,
+            "video_url": app.get("video_url"),
+            "video_duration": app.get("video_duration"),
+            "intro_video_url": app.get("intro_video_url") or app.get("video_url"),
+            "intro_video_duration": app.get("intro_video_duration") or app.get("video_duration"),
+            "interview_answers": app.get("interview_answers", []),
             "created_at": datetime.utcnow()
         }
         
@@ -385,6 +394,32 @@ def create_admin_routes(db):
             upsert=True
         )
         
+        # Synchronize into users collection so advisor can log in
+        user_account = await db.users.find_one({"email": new_psychic["email"]})
+        if user_account:
+            await db.users.update_one(
+                {"email": new_psychic["email"]},
+                {
+                    "$set": {
+                        "role": "psychic",
+                        "status": "approved",
+                        "is_active": True,
+                        "password_hash": password_hash or user_account.get("password_hash")
+                    }
+                }
+            )
+        else:
+            await db.users.insert_one({
+                "id": new_psychic["id"],
+                "email": new_psychic["email"],
+                "name": new_psychic["name"],
+                "role": "psychic",
+                "status": "approved",
+                "is_active": True,
+                "password_hash": password_hash,
+                "created_at": datetime.utcnow()
+            })
+
         # Update application status
         await target_collection.update_one(
             {"id": app_id},
@@ -423,8 +458,17 @@ def create_admin_routes(db):
             PENDING_APPLICATIONS[:] = [a for a in PENDING_APPLICATIONS if a["id"] != app_id]
             return {"success": True, "message": "Application rejected"}
         
-        # Try database
-        result = await db.psychic_applications.update_one(
+        # Try database (check both applications and psychic_applications)
+        app = await db.applications.find_one({"id": app_id})
+        target_collection = db.applications
+        if not app:
+            app = await db.psychic_applications.find_one({"id": app_id})
+            target_collection = db.psychic_applications
+            
+        if not app:
+            raise HTTPException(status_code=404, detail="Application not found")
+        
+        await target_collection.update_one(
             {"id": app_id},
             {
                 "$set": {
@@ -434,9 +478,16 @@ def create_admin_routes(db):
                 }
             }
         )
-        if result.modified_count == 0:
-            raise HTTPException(status_code=404, detail="Application not found")
-        return {"success": True}
+        if app.get("email"):
+            await db.psychics.update_one(
+                {"email": app["email"]},
+                {"$set": {"status": "rejected", "is_active": False}}
+            )
+            await db.users.update_one(
+                {"email": app["email"]},
+                {"$set": {"status": "rejected", "is_active": False}}
+            )
+        return {"success": True, "message": "Application rejected"}
     
     # ============ REFUNDS ============
     @router.get("/refunds")
@@ -955,6 +1006,7 @@ def create_admin_routes(db):
                     "id": f"psychic-{app_id}",
                     "name": app_data.get("name", app_data.get("full_name", "")),
                     "email": app_data.get("email", ""),
+                    "password_hash": app_data.get("password_hash"),
                     "bio": app_data.get("bio", app_data.get("description", "")),
                     "specialties": app_data.get("specialties", []),
                     "chat_rate": app_data.get("chat_rate", 2.99),
@@ -969,9 +1021,17 @@ def create_admin_routes(db):
                     "average_rating": 5.0,
                     "total_readings": 0,
                     "is_verified": True,
+                    "status": "approved",
+                    "video_url": app_data.get("video_url"),
+                    "intro_video_url": app_data.get("intro_video_url"),
+                    "interview_answers": app_data.get("interview_answers"),
                     "created_at": datetime.utcnow()
                 }
-                await db.psychics.insert_one(new_psychic)
+                await db.psychics.update_one(
+                    {"email": new_psychic["email"]},
+                    {"$set": new_psychic},
+                    upsert=True
+                )
                 return {"success": True, "message": "Application approved"}
         
         elif status == "rejected":
@@ -1023,6 +1083,12 @@ def create_admin_routes(db):
             "updated_at": datetime.utcnow()
         }
         await db.sales.insert_one(sale)
+        if "_id" in sale:
+            sale["_id"] = str(sale["_id"])
+        if "created_at" in sale and isinstance(sale["created_at"], datetime):
+            sale["created_at"] = sale["created_at"].isoformat()
+        if "updated_at" in sale and isinstance(sale["updated_at"], datetime):
+            sale["updated_at"] = sale["updated_at"].isoformat()
         return {"success": True, "sale": sale}
     
     @router.get("/sales")
@@ -1071,31 +1137,36 @@ def create_admin_routes(db):
             users = await db.users.find({}).to_list(1000)
             psychics = await db.psychics.find({"status": "approved"}).to_list(1000)
             
+            notifs = []
             for user in users:
-                await db.notifications.insert_one({
-                    "id": str(uuid.uuid4()),
-                    "user_id": user.get("id"),
-                    "user_type": "client",
-                    "title": f"🎉 {sale.get('name')} is LIVE!",
-                    "body": f"{sale.get('discount_percentage')}% OFF all readings! {sale.get('description')}",
-                    "type": "sale",
-                    "sale_id": sale_id,
-                    "is_read": False,
-                    "created_at": datetime.utcnow()
-                })
+                if user.get("id"):
+                    notifs.append({
+                        "id": str(uuid.uuid4()),
+                        "user_id": user.get("id"),
+                        "user_type": "client",
+                        "title": f"🎉 {sale.get('name')} is LIVE!",
+                        "body": f"{sale.get('discount_percentage')}% OFF all readings! {sale.get('description')}",
+                        "type": "sale",
+                        "sale_id": sale_id,
+                        "is_read": False,
+                        "created_at": datetime.utcnow()
+                    })
             
             for psychic in psychics:
-                await db.notifications.insert_one({
-                    "id": str(uuid.uuid4()),
-                    "user_id": psychic.get("id"),
-                    "user_type": "psychic",
-                    "title": f"🎉 {sale.get('name')} is LIVE!",
-                    "body": f"Mandatory {sale.get('discount_percentage')}% discount is now active on your readings.",
-                    "type": "sale",
-                    "sale_id": sale_id,
-                    "is_read": False,
-                    "created_at": datetime.utcnow()
-                })
+                if psychic.get("id"):
+                    notifs.append({
+                        "id": str(uuid.uuid4()),
+                        "user_id": psychic.get("id"),
+                        "user_type": "psychic",
+                        "title": f"🎉 {sale.get('name')} is LIVE!",
+                        "body": f"Mandatory {sale.get('discount_percentage')}% discount is now active on your readings.",
+                        "type": "sale",
+                        "sale_id": sale_id,
+                        "is_read": False,
+                        "created_at": datetime.utcnow()
+                    })
+            if notifs:
+                await db.notifications.insert_many(notifs, ordered=False)
         
         return {
             "success": True, 
@@ -1133,25 +1204,69 @@ def create_admin_routes(db):
     # ============ CONVERSATION MONITORING & MODERATION ============
     
     @router.get("/conversations")
-    async def get_all_conversations():
-        """Get all conversations for admin monitoring"""
-        conversations = await db.conversations.find({}).sort("last_message_time", -1).to_list(500)
+    async def get_all_conversations(limit: int = 50):
+        """Get all conversations for admin monitoring with batched lookups"""
+        conversations = await db.conversations.find({}).sort("last_message_time", -1).to_list(limit)
+        chat_sessions = await db.chat_sessions.find({}).sort("created_at", -1).to_list(limit)
         
+        # Batch fetch all psychics and users in 2 queries
+        all_psychic_ids = list(set(
+            [c.get("psychic_id") for c in conversations if c.get("psychic_id")] +
+            [s.get("psychic_id") for s in chat_sessions if s.get("psychic_id")]
+        ))
+        all_user_ids = list(set(
+            [c.get("client_id") for c in conversations if c.get("client_id")] +
+            [s.get("client_id") for s in chat_sessions if s.get("client_id")]
+        ))
+        
+        psychics_map = {}
+        if all_psychic_ids:
+            p_list = await db.psychics.find({"id": {"$in": all_psychic_ids}}).to_list(len(all_psychic_ids))
+            psychics_map = {p["id"]: p for p in p_list if "id" in p}
+            
+        users_map = {}
+        if all_user_ids:
+            u_list = await db.users.find({"id": {"$in": all_user_ids}}).to_list(len(all_user_ids))
+            users_map = {u["id"]: u for u in u_list if "id" in u}
+
         result = []
+        existing_ids = set()
+        
         for conv in conversations:
             if "_id" in conv:
                 del conv["_id"]
-            
-            # Get message count
-            msg_count = await db.messages.count_documents({"conversation_id": conv.get("id")})
-            conv["message_count"] = msg_count
-            
-            # Get psychic status
-            psychic = await db.psychics.find_one({"id": conv.get("psychic_id")})
-            conv["psychic_status"] = psychic.get("status") if psychic else "unknown"
-            conv["psychic_suspended"] = psychic.get("is_suspended", False) if psychic else False
-            
+            cid = conv.get("id")
+            psy = psychics_map.get(conv.get("psychic_id"))
+            conv["message_count"] = conv.get("message_count", 0)
+            conv["psychic_status"] = psy.get("status") if psy else "unknown"
+            conv["psychic_suspended"] = psy.get("is_suspended", False) if psy else False
             result.append(conv)
+            existing_ids.add(cid)
+            
+        for cs in chat_sessions:
+            cs_id = cs.get("id")
+            if cs_id and cs_id not in existing_ids:
+                client = users_map.get(cs.get("client_id"))
+                psychic = psychics_map.get(cs.get("psychic_id"))
+                sess_msgs = cs.get("messages", [])
+                last_msg = sess_msgs[-1].get("content") or sess_msgs[-1].get("text") if sess_msgs else "Session created"
+                last_time = cs.get("created_at") or cs.get("started_at") or datetime.utcnow()
+                if isinstance(last_time, datetime):
+                    last_time = last_time.isoformat()
+                
+                result.append({
+                    "id": cs_id,
+                    "client_id": cs.get("client_id"),
+                    "psychic_id": cs.get("psychic_id"),
+                    "client_name": client.get("name", "Client") if client else "Client",
+                    "psychic_name": psychic.get("name", "Advisor") if psychic else "Advisor",
+                    "last_message": last_msg or "Reading Session",
+                    "last_message_time": str(last_time),
+                    "message_count": len(sess_msgs),
+                    "psychic_status": psychic.get("status", "approved") if psychic else "unknown",
+                    "psychic_suspended": psychic.get("is_suspended", False) if psychic else False
+                })
+                existing_ids.add(cs_id)
         
         return result
     
@@ -1160,18 +1275,43 @@ def create_admin_routes(db):
         """Get all messages in a conversation for admin review"""
         messages = await db.messages.find({"conversation_id": conversation_id}).sort("created_at", 1).to_list(1000)
         
+        # If no messages in db.messages, check db.chat_sessions messages array
+        if not messages:
+            cs = await db.chat_sessions.find_one({"id": conversation_id})
+            if cs and "messages" in cs:
+                messages = cs.get("messages", [])
+        
+        formatted_messages = []
         for msg in messages:
-            if "_id" in msg:
-                del msg["_id"]
+            m = dict(msg)
+            if "_id" in m:
+                del m["_id"]
+            if "created_at" in m and isinstance(m["created_at"], datetime):
+                m["created_at"] = m["created_at"].isoformat()
+            if "timestamp" in m and isinstance(m["timestamp"], datetime):
+                m["timestamp"] = m["timestamp"].isoformat()
+            formatted_messages.append(m)
         
         # Get conversation details
         conversation = await db.conversations.find_one({"id": conversation_id})
+        if not conversation:
+            cs = await db.chat_sessions.find_one({"id": conversation_id})
+            if cs:
+                client = await db.users.find_one({"id": cs.get("client_id")})
+                psychic = await db.psychics.find_one({"id": cs.get("psychic_id")})
+                conversation = {
+                    "id": cs.get("id"),
+                    "client_id": cs.get("client_id"),
+                    "psychic_id": cs.get("psychic_id"),
+                    "client_name": client.get("name", "Client") if client else "Client",
+                    "psychic_name": psychic.get("name", "Advisor") if psychic else "Advisor",
+                }
         if conversation and "_id" in conversation:
             del conversation["_id"]
         
         return {
             "conversation": conversation,
-            "messages": messages
+            "messages": formatted_messages
         }
     
     @router.get("/recordings")
@@ -1345,5 +1485,26 @@ def create_admin_routes(db):
         for w in waitlist:
             w["_id"] = str(w["_id"])
         return {"waitlist": waitlist, "total": len(waitlist)}
+    
+    @router.delete("/hiring-waitlist/{email}")
+    async def remove_from_waitlist(email: str):
+        """Remove an email from hiring waitlist when processed or rejected"""
+        result = await db.hiring_waitlist.delete_one({"email": email})
+        return {"success": True, "deleted": result.deleted_count > 0}
+    
+    @router.get("/payouts")
+    async def get_admin_payouts(limit: int = 100):
+        """Get all advisor payout/withdrawal requests for admin review"""
+        payouts = await db.payouts.find({}).sort("created_at", -1).to_list(limit)
+        if not payouts:
+            payouts = await db.payout_requests.find({}).sort("created_at", -1).to_list(limit)
+        if not payouts:
+            payouts = await db.withdrawals.find({}).sort("created_at", -1).to_list(limit)
+        for p in payouts:
+            if "_id" in p:
+                p["_id"] = str(p["_id"])
+            if "created_at" in p and isinstance(p["created_at"], datetime):
+                p["created_at"] = p["created_at"].isoformat()
+        return payouts
     
     return router

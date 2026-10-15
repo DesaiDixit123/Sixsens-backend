@@ -69,3 +69,6 @@ class PsychicListResponse(BaseModel):
     offers_video_call: bool = True
     offers_recorded_readings: bool = True
     can_receive_recorded_questions: bool = False
+    intro_video_url: Optional[str] = None
+    intro_video_duration: Optional[int] = None
+    interview_answers: Optional[List[dict]] = None

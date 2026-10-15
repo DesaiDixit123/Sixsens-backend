@@ -107,52 +107,128 @@ def create_websocket_routes(db):
                     conversation_id = data.get("conversation_id")
                     manager.leave_conversation(conversation_id, user_id)
                 
-                elif message_type == "message":
+                elif message_type in ("message", "new_message"):
                     conversation_id = data.get("conversation_id")
                     receiver_id = data.get("receiver_id")
-                    content = data.get("content")
+                    content = data.get("content") or data.get("text") or ""
                     image_url = data.get("image_url")
                     
+                    # Ensure user is in conversation
+                    if conversation_id:
+                        manager.join_conversation(conversation_id, user_id)
+                    
                     # Save message to database
+                    msg_id = data.get("id") or str(uuid.uuid4())
+                    now = datetime.utcnow()
+                    sender_type = data.get("sender_type")
+                    if not sender_type:
+                        is_psy = await db.psychics.find_one({"id": user_id})
+                        sender_type = "psychic" if is_psy else "client"
+                    receiver_type = "client" if sender_type == "psychic" else "psychic"
+                    
                     message = {
-                        "id": str(uuid.uuid4()),
+                        "id": msg_id,
+                        "conversation_id": conversation_id,
+                        "sender_id": user_id,
+                        "sender_type": sender_type,
+                        "receiver_id": receiver_id,
+                        "receiver_type": receiver_type,
+                        "content": content,
+                        "image_url": image_url,
+                        "is_read": False,
+                        "created_at": now
+                    }
+                    await db.messages.insert_one(message)
+                    
+                    # Also push to chat_sessions messages array if this is an active session
+                    if conversation_id:
+                        await db.chat_sessions.update_one(
+                            {"id": conversation_id},
+                            {"$push": {"messages": {
+                                "id": msg_id,
+                                "sender_id": user_id,
+                                "message": content,
+                                "message_type": "image" if image_url else "text",
+                                "image_url": image_url,
+                                "timestamp": now.isoformat()
+                            }}}
+                        )
+                    
+                    if "_id" in message:
+                        message["_id"] = str(message["_id"])
+                    
+                    message_dict = {
+                        "id": msg_id,
                         "conversation_id": conversation_id,
                         "sender_id": user_id,
                         "receiver_id": receiver_id,
                         "content": content,
                         "image_url": image_url,
                         "is_read": False,
-                        "created_at": datetime.utcnow()
+                        "created_at": now.isoformat()
                     }
-                    await db.messages.insert_one(message)
                     
-                    # Send to receiver if online
+                    # Unified payload matching both client app and advisor app models
                     outgoing_message = {
                         "type": "new_message",
-                        "message": {
-                            **message,
-                            "created_at": message["created_at"].isoformat()
-                        }
+                        "id": msg_id,
+                        "conversation_id": conversation_id,
+                        "sender_id": user_id,
+                        "receiver_id": receiver_id,
+                        "content": content,
+                        "text": content,
+                        "image_url": image_url,
+                        "timestamp": now.isoformat(),
+                        "created_at": now.isoformat(),
+                        "message": message_dict
                     }
-                    await manager.send_personal_message(outgoing_message, receiver_id)
+                    
+                    # Direct send to receiver and conversation broadcast without duplicate sends
+                    delivered_to = set()
+                    if receiver_id and manager.is_user_online(receiver_id):
+                        await manager.send_personal_message(outgoing_message, receiver_id)
+                        # Also send with type: 'message' for legacy handlers
+                        await manager.send_personal_message({**outgoing_message, "type": "message"}, receiver_id)
+                        delivered_to.add(receiver_id)
+                    
+                    if conversation_id and conversation_id in manager.conversations:
+                        for participant_id in manager.conversations[conversation_id]:
+                            if participant_id != user_id and participant_id not in delivered_to:
+                                await manager.send_personal_message(outgoing_message, participant_id)
+                                await manager.send_personal_message({**outgoing_message, "type": "message"}, participant_id)
+                                delivered_to.add(participant_id)
                     
                     # Confirm to sender
                     await websocket.send_json({
                         "type": "message_sent",
-                        "message_id": message["id"]
+                        "message_id": msg_id,
+                        "conversation_id": conversation_id
                     })
                 
-                elif message_type == "typing":
+                elif message_type in ("typing", "typing_indicator"):
                     conversation_id = data.get("conversation_id")
                     receiver_id = data.get("receiver_id")
                     is_typing = data.get("is_typing", True)
                     
-                    await manager.send_personal_message({
+                    typing_payload = {
                         "type": "typing_indicator",
                         "conversation_id": conversation_id,
                         "user_id": user_id,
                         "is_typing": is_typing
-                    }, receiver_id)
+                    }
+                    
+                    delivered_typing = set()
+                    if receiver_id and manager.is_user_online(receiver_id):
+                        await manager.send_personal_message(typing_payload, receiver_id)
+                        await manager.send_personal_message({**typing_payload, "type": "typing"}, receiver_id)
+                        delivered_typing.add(receiver_id)
+                    
+                    if conversation_id and conversation_id in manager.conversations:
+                        for participant_id in manager.conversations[conversation_id]:
+                            if participant_id != user_id and participant_id not in delivered_typing:
+                                await manager.send_personal_message(typing_payload, participant_id)
+                                await manager.send_personal_message({**typing_payload, "type": "typing"}, participant_id)
+                                delivered_typing.add(participant_id)
                 
                 elif message_type == "read_receipt":
                     message_ids = data.get("message_ids", [])
@@ -171,6 +247,26 @@ def create_websocket_routes(db):
                         "read_by": user_id
                     }, sender_id)
                 
+                elif message_type == "one_minute_warning":
+                    conversation_id = data.get("conversation_id")
+                    receiver_id = data.get("receiver_id")
+                    warning_text = "⏰ This chat has approximately 1 minute remaining. Please inform the client that they can add more minutes if they would like to continue."
+                    
+                    warning_msg = {
+                        "type": "one_minute_warning",
+                        "conversation_id": conversation_id,
+                        "text": warning_text,
+                        "content": warning_text,
+                        "sender": "system",
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                    if receiver_id and manager.is_user_online(receiver_id):
+                        await manager.send_personal_message(warning_msg, receiver_id)
+                    if conversation_id and conversation_id in manager.conversations:
+                        for participant_id in manager.conversations[conversation_id]:
+                            if participant_id != user_id and participant_id != receiver_id:
+                                await manager.send_personal_message(warning_msg, participant_id)
+
                 elif message_type == "ping":
                     await websocket.send_json({"type": "pong"})
         

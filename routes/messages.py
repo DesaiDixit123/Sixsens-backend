@@ -275,8 +275,23 @@ def create_messages_routes(db):
         skip: int = 0
     ):
         """
-        Get messages in a conversation
+        Get messages in a conversation (restricted to conversation participants)
         """
+        # Enforce conversation participant authorization
+        conv = await db.conversations.find_one({"id": conversation_id})
+        if conv:
+            if user_id not in (conv.get("client_id"), conv.get("psychic_id"), conv.get("user_id")):
+                raise HTTPException(status_code=403, detail="Not authorized to view this conversation")
+        else:
+            session = await db.chat_sessions.find_one({"id": conversation_id})
+            if session:
+                if user_id not in (session.get("client_id"), session.get("psychic_id"), session.get("user_id")):
+                    raise HTTPException(status_code=403, detail="Not authorized to view this conversation")
+            else:
+                sample_msg = await db.messages.find_one({"conversation_id": conversation_id})
+                if sample_msg and user_id not in (sample_msg.get("sender_id"), sample_msg.get("receiver_id")):
+                    raise HTTPException(status_code=403, detail="Not authorized to view this conversation")
+
         messages = await db.messages.find(
             {"conversation_id": conversation_id}
         ).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
@@ -294,7 +309,16 @@ def create_messages_routes(db):
         # Reverse to show oldest first
         messages.reverse()
         
-        return [MessageResponse(**msg) for msg in messages]
+        normalized = []
+        for msg in messages:
+            if "content" not in msg and "text" in msg:
+                msg["content"] = msg["text"]
+            if "created_at" not in msg and "timestamp" in msg:
+                msg["created_at"] = msg["timestamp"]
+            if "created_at" not in msg:
+                msg["created_at"] = datetime.utcnow()
+            normalized.append(MessageResponse(**msg))
+        return normalized
     
     @router.get("/remaining/{user_id}")
     async def get_remaining_messages(

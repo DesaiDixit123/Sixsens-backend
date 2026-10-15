@@ -909,6 +909,9 @@ def create_psychic_routes(db: AsyncIOMotorDatabase):
                     "offers_recorded_readings": offers_recorded,
                     "offers_standard_readings": offers_standard,
                     "offers_emergency_readings": offers_emergency,
+                    "intro_video_url": db_psychic.get("intro_video_url") or db_psychic.get("video_url"),
+                    "intro_video_duration": db_psychic.get("intro_video_duration") or db_psychic.get("video_duration"),
+                    "interview_answers": db_psychic.get("interview_answers", []),
                 }
                 return PsychicListResponse(**real_psychic)
         except Exception as e:
@@ -1141,10 +1144,26 @@ def create_user_routes(db: AsyncIOMotorDatabase):
                 {"id": user_id},
                 {"$set": {"recently_visited_psychics": visited}}
             )
-            
             return {"success": True}
         except Exception as e:
             print(f"Error adding recently visited: {e}")
             return {"success": False}
     
+    @user_router.put("/{user_id}/mark-first-reading-used")
+    async def mark_first_reading_used_endpoint(user_id: str):
+        """Mark the user's first free reading as used"""
+        user = await db.users.find_one({"id": user_id})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        await db.users.update_one(
+            {"id": user_id},
+            {"$set": {
+                "first_reading_free_used": True,
+                "is_new_user": False
+            }}
+        )
+        return {"success": True, "message": "First reading marked as used"}
+    
     return user_router
+

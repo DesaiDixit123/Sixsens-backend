@@ -267,9 +267,9 @@ def create_stripe_connect_router(db: AsyncIOMotorDatabase):
         if not psychic_id or amount <= 0:
             raise HTTPException(status_code=400, detail="Missing psychic_id or invalid amount")
         
-        # BE-039: Minimum $50 payout threshold
-        if amount < 50.0:
-            raise HTTPException(status_code=400, detail="Minimum payout threshold is $50.00")
+        # Minimum $40 payout threshold
+        if amount < 40.0:
+            raise HTTPException(status_code=400, detail="Minimum payout threshold is $40.00")
         
         # BE-037: Instant payout fee calculation (1.5% fee, min $0.50)
         fee = max(0.50, round(amount * 0.015, 2)) if is_instant else 0.0
@@ -315,6 +315,8 @@ def create_stripe_connect_router(db: AsyncIOMotorDatabase):
                 "amount": amount,
             }
             
+        except HTTPException:
+            raise
         except stripe.error.StripeError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:

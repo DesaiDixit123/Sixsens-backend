@@ -6,6 +6,7 @@ import sys
 import os
 import httpx
 from pathlib import Path
+from pymongo import ReturnDocument
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.chat import ChatSession, ChatSessionCreate, ChatMessage, AddMinutesRequest
@@ -153,6 +154,7 @@ def create_chat_routes(db):
     @router.post("/request")
     async def request_chat_session(session: ChatSessionCreate, background_tasks: BackgroundTasks, user_id: str = None, user_name: str = "Client"):
         """Request a chat/phone/video session - advisor must accept"""
+        user_id = user_id or getattr(session, "client_id", None)
         if not user_id:
             raise HTTPException(status_code=400, detail="User ID required")
         
@@ -170,14 +172,23 @@ def create_chat_routes(db):
         
         # Get rate based on session type
         rate_key = f"{session.session_type}_rate"
-        rate = psychic.get(rate_key, 2.99)
+        rate = psychic.get(rate_key) or psychic.get("rate_per_minute") or psychic.get("price_per_minute") or 2.99
         
+        # Determine whether client is NEW or RETURNING
+        prior_sessions = await db.chat_sessions.count_documents({
+            "client_id": user_id,
+            "psychic_id": session.psychic_id,
+            "status": "completed"
+        })
+        client_type = "RETURNING CLIENT" if prior_sessions > 0 else "NEW CLIENT"
+
         # Create a pending session request
         request_id = str(uuid.uuid4())
         session_request = {
             "id": request_id,
             "client_id": user_id,
             "client_name": user_name,
+            "client_type": client_type,
             "psychic_id": session.psychic_id,
             "psychic_email": psychic.get("email"),
             "session_type": session.session_type,
@@ -203,6 +214,7 @@ def create_chat_routes(db):
             "success": True,
             "request_id": request_id,
             "status": "pending",
+            "client_type": client_type,
             "message": "Waiting for advisor to accept..."
         }
     
@@ -322,6 +334,23 @@ def create_chat_routes(db):
         
         return {"success": True, "status": "rejected"}
     
+    @router.delete("/request/{request_id}")
+    @router.post("/request/{request_id}/cancel")
+    async def cancel_session_request(request_id: str):
+        """Client cancels a pending session request (CLI-063)"""
+        result = await db.session_requests.update_one(
+            {"id": request_id, "status": "pending"},
+            {"$set": {"status": "cancelled", "cancelled_at": datetime.utcnow()}}
+        )
+        
+        if result.matched_count == 0:
+            req = await db.session_requests.find_one({"id": request_id})
+            if not req:
+                return {"success": True, "status": "cancelled", "message": "Request not found or already closed"}
+            return {"success": True, "status": req.get("status", "cancelled"), "message": "Request already processed"}
+            
+        return {"success": True, "status": "cancelled", "message": "Request cancelled successfully"}
+    
     @router.post("/start")
     async def start_session(session: ChatSessionCreate, user_id: str = None, use_free_minutes: bool = False):
         """Start a new chat/phone/video session"""
@@ -338,20 +367,27 @@ def create_chat_routes(db):
         
         # Get rate based on session type
         rate_key = f"{session.session_type}_rate"
-        rate = psychic.get(rate_key, 2.99)
+        rate = psychic.get(rate_key) or psychic.get("rate_per_minute") or psychic.get("price_per_minute") or 2.99
         
-        # Check if user is using free minutes
+        # Check user and enforce one-time 4-minute free trial
+        user = await db.users.find_one({"id": user_id})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
         free_minutes_used = False
         if use_free_minutes:
-            # Mark free minutes as USED immediately when session starts
-            # This ensures free minutes are only used ONCE, even if session ends early
-            user = await db.users.find_one({"id": user_id})
-            if user and not user.get("first_reading_free_used", False):
-                await db.users.update_one(
-                    {"id": user_id},
-                    {"$set": {"first_reading_free_used": True}}
+            # Atomic check-and-set: prevents concurrent race conditions
+            updated_user = await db.users.find_one_and_update(
+                {"id": user_id, "first_reading_free_used": {"$ne": True}},
+                {"$set": {"first_reading_free_used": True, "is_new_user": False}},
+                return_document=ReturnDocument.AFTER
+            )
+            if not updated_user:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Your one-time 4-minute free trial has already been used."
                 )
-                free_minutes_used = True
+            free_minutes_used = True
         
         # Calculate initial cost (free if using free minutes)
         initial_cost = 0 if free_minutes_used else (rate * session.initial_minutes)
@@ -378,6 +414,9 @@ def create_chat_routes(db):
             {"id": session.psychic_id},
             {"$set": {"online_status": "busy"}}
         )
+        
+        if "_id" in session_data:
+            session_data["_id"] = str(session_data["_id"])
         
         return {
             "success": True, 
@@ -608,6 +647,8 @@ def create_chat_routes(db):
         session = await db.chat_sessions.find_one({"id": session_id})
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
+        if "_id" in session:
+            session["_id"] = str(session["_id"])
         return session
     
     @router.get("/active/{user_id}")
@@ -617,6 +658,9 @@ def create_chat_routes(db):
             "client_id": user_id,
             "status": "active"
         }).to_list(10)
+        for s in sessions:
+            if "_id" in s:
+                s["_id"] = str(s["_id"])
         return sessions
     
     @router.get("/history/{user_id}")
@@ -625,6 +669,9 @@ def create_chat_routes(db):
         sessions = await db.chat_sessions.find({
             "client_id": user_id
         }).sort("started_at", -1).to_list(limit)
+        for s in sessions:
+            if "_id" in s:
+                s["_id"] = str(s["_id"])
         return sessions
     
     return router

@@ -97,6 +97,12 @@ def create_application_routes(db):
                 detail="Your previous application was not approved. You cannot submit a new application."
             )
         
+        # Hash password if provided
+        password_hash = None
+        if application_data.password:
+            from routes.auth import hash_password
+            password_hash = hash_password(application_data.password)
+
         # Create application
         new_application = PsychicApplication(
             id=str(uuid.uuid4()),
@@ -113,8 +119,15 @@ def create_application_routes(db):
             tax_form_type=application_data.tax_form_type,
             tax_form_completed=application_data.tax_form_completed,
             paypal_email=application_data.paypal_email,
+            bank_name=application_data.bank_name,
+            account_number=application_data.account_number,
+            routing_number=application_data.routing_number,
+            password_hash=password_hash,
             video_url=application_data.video_url,
             video_duration=application_data.video_duration,
+            intro_video_url=application_data.intro_video_url,
+            intro_video_duration=application_data.intro_video_duration,
+            interview_answers=application_data.interview_answers,
             status="pending"
         )
         
@@ -371,30 +384,66 @@ The Psychic Advisor Team
                 """
             )
             
-            # Create psychic account
+            # Create or activate psychic account
+            psychic_id = str(uuid.uuid4())
             new_psychic = {
-                "id": str(uuid.uuid4()),
+                "id": psychic_id,
                 "application_id": application_id,
                 "name": applicant_name,
                 "email": applicant_email,
-                "phone": application["phone"],
-                "country": application["country"],
-                "specialties": application["specialties"],
-                "bio": application["bio"],
-                "years_experience": application["years_experience"],
+                "phone": application.get("phone"),
+                "country": application.get("country"),
+                "specialties": application.get("specialties", ["Love & Relationships"]),
+                "bio": application.get("bio", ""),
+                "years_experience": application.get("years_experience", 2),
                 "tools_used": application.get("tools_used", []),
                 "chat_rate": 2.99,
-                "phone_rate": 3.99,
-                "video_rate": 4.99,
                 "online_status": "offline",
                 "is_verified": True,
+                "status": "approved",
+                "password_hash": application.get("password_hash"),
+                "bank_name": application.get("bank_name"),
+                "account_number": application.get("account_number"),
+                "routing_number": application.get("routing_number"),
                 "average_rating": 0,
                 "total_readings": 0,
+                "available_balance": 0.0,
+                "pending_balance": 0.0,
+                "total_earnings": 0.0,
                 "created_at": datetime.utcnow()
             }
-            await db.psychics.insert_one(new_psychic)
+            await db.psychics.update_one(
+                {"email": applicant_email},
+                {"$set": new_psychic},
+                upsert=True
+            )
+            
+            # Synchronize with users collection for authentication
+            await db.users.update_one(
+                {"email": applicant_email},
+                {"$set": {
+                    "id": psychic_id,
+                    "name": applicant_name,
+                    "email": applicant_email,
+                    "password_hash": application.get("password_hash"),
+                    "user_type": "psychic",
+                    "is_verified": True,
+                    "status": "active",
+                    "created_at": datetime.utcnow()
+                }},
+                upsert=True
+            )
             
         elif status_update.status == "rejected":
+            # Deactivate any psychic account if present
+            await db.psychics.update_many(
+                {"email": applicant_email},
+                {"$set": {"status": "rejected", "online_status": "offline"}}
+            )
+            await db.users.update_many(
+                {"email": applicant_email},
+                {"$set": {"status": "rejected"}}
+            )
             # Send rejection notification
             await create_applicant_notification(
                 applicant_id=application_id,

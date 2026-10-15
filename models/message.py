@@ -24,12 +24,12 @@ class MessageResponse(BaseModel):
     id: str
     conversation_id: str
     sender_id: str
-    sender_type: str
+    sender_type: Optional[str] = "client"
     receiver_id: str
-    receiver_type: str
+    receiver_type: Optional[str] = "psychic"
     content: str
     image_url: Optional[str] = None
-    is_read: bool
+    is_read: bool = False
     created_at: datetime
 
 class Conversation(BaseModel):
