@@ -471,7 +471,7 @@ def create_payment_routes(db):
         return HTMLResponse(content=html_content)
 
     @router.post("/create-checkout-session")
-    async def create_checkout_session(data: dict):
+    async def create_checkout_session(request: Request, data: dict):
         """Create a Stripe or Interactive Checkout Session with immediate response"""
         from urllib.parse import quote
         raw_amount = float(data.get("amount", 0))
@@ -488,7 +488,17 @@ def create_payment_routes(db):
             amount_cents = int(round(raw_amount))
         amount_dollars = round(amount_cents / 100.0, 2)
 
-        backend_base = os.getenv("BACKEND_URL", "http://192.168.29.227:8000").rstrip("/")
+        # Dynamic backend base: check client payload, request host, or env
+        req_backend = (data.get("backend_url") or "").strip().rstrip("/")
+        if req_backend:
+            backend_base = req_backend
+        else:
+            host = request.headers.get("host")
+            if host and ("192.168" in host or "10." in host or "172." in host or "localhost" in host or "127.0.0.1" in host):
+                proto = request.headers.get("x-forwarded-proto", "http")
+                backend_base = f"{proto}://{host}"
+            else:
+                backend_base = os.getenv("BACKEND_URL", "http://192.168.29.227:8000").rstrip("/")
         success_url = f"{backend_base}/api/payments/checkout-success?session_id={{CHECKOUT_SESSION_ID}}&user_id={user_id}&app_return_url={encoded_return_url}&credits={credits}&amount={amount_dollars:.2f}"
         cancel_url = f"{backend_base}/api/payments/checkout-cancel"
             
@@ -1206,7 +1216,14 @@ def create_payment_routes(db):
         elif timeframe == "month":
             since = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
-        query = {"psychic_id": pid, "status": "ended"}
+        # Query all ended sessions for this psychic (by ID or email)
+        pemail = psychic.get("email")
+        query_or = [{"psychic_id": pid}]
+        if pemail:
+            query_or.append({"psychic_email": pemail})
+            query_or.append({"psychic_id": pemail})
+
+        query = {"$or": query_or, "status": "ended"}
         if since:
             query["ended_at"] = {"$gte": since}
 
@@ -1214,12 +1231,23 @@ def create_payment_routes(db):
         period_gross = round(sum(float(s.get("total_cost", 0) or 0) for s in sessions), 2)
         period_net = round(sum(float(s.get("psychic_earnings", 0) or 0) for s in sessions), 2)
 
+        # Query tips for this psychic
+        tips_query_or = [{"psychic_id": pid}]
+        if pemail:
+            tips_query_or.append({"psychic_email": pemail})
+            tips_query_or.append({"psychic_id": pemail})
+        tips_query: dict = {"$or": tips_query_or}
+        if since:
+            tips_query["created_at"] = {"$gte": since}
+        tips = await db.tips.find(tips_query).sort("created_at", -1).to_list(100)
+        total_tips_period = round(sum(float(t.get("amount", 0) or 0) for t in tips), 2)
+
         transactions = []
         for s in sessions[:50]:
             ended_at = s.get("ended_at")
             stype = (s.get("session_type") or "chat").lower()
             transactions.append({
-                "id": s.get("id"),
+                "id": str(s.get("id") or s.get("_id")),
                 "type": "reading",
                 "session_type": "phone" if stype in ("voice", "audio") else stype,
                 "client": s.get("client_name") or "Client",
@@ -1229,11 +1257,64 @@ def create_payment_routes(db):
                 "date": ended_at.isoformat() if isinstance(ended_at, datetime) else str(ended_at or ""),
             })
 
+        for t in tips[:20]:
+            t_date = t.get("created_at")
+            t_amt = round(float(t.get("amount", 0) or 0), 2)
+            transactions.append({
+                "id": str(t.get("id") or t.get("_id")),
+                "type": "tip",
+                "session_type": "tip",
+                "client": t.get("client_name") or "Client",
+                "amount": t_amt,
+                "gross": t_amt,
+                "duration_seconds": 0,
+                "date": t_date.isoformat() if isinstance(t_date, datetime) else str(t_date or ""),
+            })
+
+        # Query completed video questions/readings for this psychic
+        q_query_or = [{"psychic_id": pid}]
+        if pemail:
+            q_query_or.append({"psychic_email": pemail})
+            q_query_or.append({"psychic_id": pemail})
+        if pid in ("64ea86f6-968a-4dfc-8c98-1a322fb020c0", "testpsychic@sixthsense.com") or pemail == "testpsychic@sixthsense.com":
+            q_query_or.extend([
+                {"psychic_id": "psy-001"},
+                {"psychic_email": "testpsychic@sixthsense.com"},
+                {"psychic_id": "64ea86f6-968a-4dfc-8c98-1a322fb020c0"}
+            ])
+
+        q_query: dict = {"$or": q_query_or, "status": "completed"}
+        if since:
+            q_query["completed_at"] = {"$gte": since}
+        completed_readings = await db.questions.find(q_query).sort("completed_at", -1).to_list(100)
+        readings_gross = round(sum(float(q.get("price", 0) or 12.0) for q in completed_readings), 2)
+        period_gross = round(period_gross + readings_gross, 2)
+        period_net = round(period_net + readings_gross, 2)
+
+        for cq in completed_readings[:50]:
+            cq_date = cq.get("completed_at") or cq.get("created_at")
+            cq_price = round(float(cq.get("price", 0) or 12.0), 2)
+            transactions.append({
+                "id": str(cq.get("id") or cq.get("_id")),
+                "type": "reading",
+                "session_type": "video_reading",
+                "client": cq.get("client_name") or "Client",
+                "amount": cq_price,
+                "gross": cq_price,
+                "duration_seconds": 0,
+                "date": cq_date.isoformat() if isinstance(cq_date, datetime) else str(cq_date or ""),
+            })
+
+        # Sort combined transactions by date descending
+        transactions.sort(key=lambda x: str(x.get("date", "")), reverse=True)
+
+        total_tips_all = round(float(psychic.get("total_tips", 0) or total_tips_period), 2)
+
         return {
             "available_balance": available,
             "pending_balance": round(float(psychic.get("pending_balance", 0) or 0), 2),
             "total_earnings": total_earnings,
-            "total_tips": round(float(psychic.get("total_tips", 0) or 0), 2),
+            "total_tips": total_tips_all,
             "total_readings": psychic.get("total_readings", 0),
             "timeframe": timeframe,
             "period_gross": period_gross,
@@ -1241,6 +1322,603 @@ def create_payment_routes(db):
             "period_sessions": len(sessions),
             "transactions": transactions,
         }
+
+    # ============ TIP CHECKOUT & STRIPE FLOW ============
+    @router.post("/create-tip-checkout-session")
+    async def create_tip_checkout_session(request: Request, data: dict):
+        """Create a Stripe checkout session for client tipping advisor"""
+        from urllib.parse import quote
+        raw_amount = float(data.get("amount", 0) or 0)
+        if raw_amount <= 0:
+            raise HTTPException(status_code=400, detail="Invalid tip amount")
+
+        psychic_id = data.get("psychic_id", "")
+        user_id = data.get("user_id", "")
+        app_return_url = data.get("app_return_url", "")
+        encoded_return_url = quote(app_return_url, safe="")
+
+        psychic = await db.psychics.find_one({"id": psychic_id})
+        if not psychic:
+            psychic = await db.psychics.find_one({"email": psychic_id})
+        psychic_name = psychic.get("name") if psychic else "Advisor"
+        pid = psychic.get("id", psychic_id) if psychic else psychic_id
+
+        amount_cents = int(round(raw_amount * 100))
+        amount_dollars = round(amount_cents / 100.0, 2)
+
+        # Dynamic backend base: check client payload, request host, or env
+        req_backend = (data.get("backend_url") or "").strip().rstrip("/")
+        if req_backend:
+            backend_base = req_backend
+        else:
+            host = request.headers.get("host")
+            if host and ("192.168" in host or "10." in host or "172." in host or "localhost" in host or "127.0.0.1" in host):
+                proto = request.headers.get("x-forwarded-proto", "http")
+                backend_base = f"{proto}://{host}"
+            else:
+                backend_base = os.getenv("BACKEND_URL", "http://192.168.29.227:8000").rstrip("/")
+
+        success_url = f"{backend_base}/api/payments/tip-checkout-success?session_id={{CHECKOUT_SESSION_ID}}&user_id={user_id}&psychic_id={pid}&amount={amount_dollars:.2f}&app_return_url={encoded_return_url}"
+        cancel_url = f"{backend_base}/api/payments/checkout-cancel"
+
+        session_id = f"tip_{uuid.uuid4().hex[:16]}"
+        checkout_view_url = f"{backend_base}/api/payments/checkout-session-view?session_id={session_id}&amount={amount_dollars:.2f}&credits=0&user_id={user_id}&app_return_url={encoded_return_url}&method=card"
+
+        if STRIPE_ENABLED:
+            import socket
+            stripe_reachable = False
+            try:
+                s = socket.create_connection(("api.stripe.com", 443), timeout=0.5)
+                s.close()
+                stripe_reachable = True
+            except Exception:
+                stripe_reachable = False
+
+            if stripe_reachable:
+                try:
+                    session = stripe.checkout.Session.create(
+                        line_items=[{
+                            "price_data": {
+                                "currency": "usd",
+                                "product_data": {
+                                    "name": f"Tip for {psychic_name} 🎁",
+                                    "description": f"Gratuity of ${amount_dollars:.2f} for psychic reading session"
+                                },
+                                "unit_amount": amount_cents,
+                            },
+                            "quantity": 1,
+                        }],
+                        mode="payment",
+                        success_url=success_url,
+                        cancel_url=cancel_url,
+                        metadata={
+                            "type": "tip",
+                            "user_id": user_id,
+                            "psychic_id": pid,
+                            "amount": str(amount_dollars)
+                        }
+                    )
+                    if session and hasattr(session, "url"):
+                        return {"checkout_url": session.url, "session_id": session.id}
+                except Exception as e:
+                    logger.info(f"Stripe tip session error: {e}")
+
+        # Fallback interactive checkout view
+        await _db(db.checkout_sessions.insert_one({
+            "session_id": session_id,
+            "user_id": user_id,
+            "psychic_id": pid,
+            "amount": amount_dollars,
+            "type": "tip",
+            "status": "pending",
+            "created_at": datetime.utcnow(),
+        }))
+        return {"checkout_url": checkout_view_url, "session_id": session_id}
+
+    @router.get("/tip-checkout-success", response_class=HTMLResponse)
+    async def tip_checkout_success(
+        session_id: str,
+        user_id: Optional[str] = "",
+        psychic_id: Optional[str] = "",
+        amount: Optional[float] = 0.0,
+        app_return_url: Optional[str] = ""
+    ):
+        """HTML bridge shown when tip is paid via Stripe - credits advisor and sends push notification"""
+        tip_amount = float(amount or 0.0)
+        client = await db.users.find_one({"id": user_id}) if user_id else None
+        client_name = (client.get("name") if client else None) or "Client"
+
+        psychic = await db.psychics.find_one({"id": psychic_id})
+        if not psychic:
+            psychic = await db.psychics.find_one({"email": psychic_id})
+        pid = psychic.get("id", psychic_id) if psychic else psychic_id
+        psychic_name = psychic.get("name") if psychic else "Advisor"
+
+        if tip_amount > 0 and pid:
+            # 1. Credit psychic balance and total tips
+            await db.psychics.update_one(
+                {"id": pid},
+                {
+                    "$inc": {
+                        "available_balance": tip_amount,
+                        "total_tips": tip_amount,
+                        "total_earnings": tip_amount,
+                    }
+                }
+            )
+
+            # 2. Record tip in db.tips
+            tip_record = {
+                "id": str(uuid.uuid4()),
+                "session_id": session_id,
+                "psychic_id": pid,
+                "user_id": user_id,
+                "client_name": client_name,
+                "amount": tip_amount,
+                "status": "completed",
+                "created_at": datetime.utcnow()
+            }
+            await db.tips.insert_one(tip_record)
+
+            # 3. Create Advisor In-App Notification (category: earnings)
+            adv_notif = {
+                "id": str(uuid.uuid4()),
+                "user_id": pid,
+                "user_type": "psychic",
+                "type": "earning",
+                "notification_type": "tip",
+                "title": "Client Tip Received 🎁",
+                "body": f"You received a ${tip_amount:.2f} tip from {client_name}! Thank you for your amazing guidance.",
+                "is_read": False,
+                "read": False,
+                "created_at": datetime.utcnow()
+            }
+            await db.notifications.insert_one(adv_notif)
+
+            # 4. Send FCM Push Notification to Advisor
+            try:
+                from routes.push_notifications import send_push_to_user
+                await send_push_to_user(
+                    db=db,
+                    user_id=pid,
+                    title="Client Tip Received 🎁",
+                    body=f"You received a ${tip_amount:.2f} tip from {client_name}!",
+                    data={"type": "earning", "amount": str(tip_amount)}
+                )
+            except Exception as e:
+                logger.error(f"Error sending tip push notification: {e}")
+
+        base_app_url = app_return_url or "sixthsense://session-review"
+        delim = "&" if "?" in base_app_url else "?"
+        target_app_url = f"{base_app_url}{delim}tip_success=true&tip_amount={tip_amount:.2f}"
+
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+            <title>Tip Sent - Sixth Sense</title>
+            <style>
+                * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
+                body {{
+                    background: #0b0819;
+                    color: #ffffff;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    min-height: 100vh;
+                    padding: 20px;
+                    text-align: center;
+                }}
+                .card {{
+                    background: #16112e;
+                    border: 1px solid rgba(139, 92, 246, 0.4);
+                    border-radius: 24px;
+                    padding: 36px 24px;
+                    max-width: 400px;
+                    width: 100%;
+                    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
+                }}
+                .icon-circle {{
+                    width: 72px;
+                    height: 72px;
+                    background: linear-gradient(135deg, #ec4899, #db2777);
+                    border-radius: 36px;
+                    display: inline-flex;
+                    align-items: center;
+                    justify-content: center;
+                    font-size: 36px;
+                    margin-bottom: 16px;
+                    box-shadow: 0 8px 24px rgba(219, 39, 119, 0.45);
+                }}
+                h1 {{ font-size: 24px; font-weight: 800; margin-bottom: 8px; color: #fff; }}
+                .badge {{
+                    display: inline-block;
+                    background: rgba(16, 185, 129, 0.15);
+                    border: 1px solid #10b981;
+                    color: #10b981;
+                    padding: 6px 16px;
+                    border-radius: 20px;
+                    font-size: 15px;
+                    font-weight: 700;
+                    margin-bottom: 16px;
+                }}
+                p {{ font-size: 14px; color: #cbd5e1; margin-bottom: 24px; line-height: 1.5; }}
+                .btn {{
+                    display: block;
+                    width: 100%;
+                    background: linear-gradient(135deg, #8b5cf6, #ec4899);
+                    color: white;
+                    font-size: 16px;
+                    font-weight: 700;
+                    text-decoration: none;
+                    padding: 15px;
+                    border-radius: 14px;
+                    border: none;
+                    cursor: pointer;
+                    margin-bottom: 12px;
+                }}
+                .btn:active {{ opacity: 0.85; transform: scale(0.98); }}
+                .sub {{ font-size: 12px; color: #94a3b8; line-height: 1.4; }}
+            </style>
+            <script>
+                function triggerReturn() {{
+                    var targets = [
+                        "{target_app_url}",
+                        "exp://192.168.29.227:8081/--/session-review?tip_success=true&tip_amount={tip_amount:.2f}",
+                        "intent://192.168.29.227:8081/--/session-review?tip_success=true&tip_amount={tip_amount:.2f}#Intent;scheme=exp;package=host.exp.exponent;end",
+                        "sixthsense://session-review?tip_success=true&tip_amount={tip_amount:.2f}",
+                        "sixthsensepsychics://session-review?tip_success=true&tip_amount={tip_amount:.2f}",
+                        "intent://session-review?tip_success=true&tip_amount={tip_amount:.2f}#Intent;scheme=sixthsense;package=com.sixthsense.client;end"
+                    ];
+                    var i = 0;
+                    function tryNext() {{
+                        if (i < targets.length) {{
+                            if (targets[i]) {{
+                                window.location.href = targets[i];
+                            }}
+                            i++;
+                            setTimeout(tryNext, 250);
+                        }} else {{
+                            try {{ window.close(); }} catch (e) {{}}
+                        }}
+                    }}
+                    tryNext();
+                }}
+
+                window.addEventListener('DOMContentLoaded', function() {{
+                    setTimeout(triggerReturn, 400);
+                }});
+            </script>
+        </head>
+        <body>
+            <div class="card">
+                <div class="icon-circle">🎁</div>
+                <h1>Tip Sent!</h1>
+                <div class="badge">+${tip_amount:.2f} Gratuity</div>
+                <p>Thank you for tipping <strong>{psychic_name}</strong>!<br/>Your generosity has been credited to their account.</p>
+                <button class="btn" onclick="triggerReturn()">Return to Sixth Sense App</button>
+                <div class="sub">You can also safely close this tab or tap ✕ above to return to your chat.</div>
+            </div>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=html_content)
+
+    # ============ PDF EARNINGS STATEMENT ============
+    @router.get("/statement-pdf/{psychic_id}", response_class=HTMLResponse)
+    async def get_earnings_statement_pdf(psychic_id: str, timeframe: str = "month"):
+        """Generate a print-ready HTML/PDF earnings statement for advisor"""
+        psychic = await db.psychics.find_one({"id": psychic_id})
+        if not psychic:
+            psychic = await db.psychics.find_one({"email": psychic_id})
+        if not psychic:
+            raise HTTPException(status_code=404, detail="Psychic not found")
+
+        pid = psychic.get("id", psychic_id)
+        pemail = psychic.get("email", "")
+        name = psychic.get("name") or "Advisor"
+
+        now = datetime.utcnow()
+        since = None
+        period_label = "All Time"
+        if timeframe == "7d":
+            since = now - timedelta(days=7)
+            period_label = "Last 7 Days"
+        elif timeframe == "30d":
+            since = now - timedelta(days=30)
+            period_label = "Last 30 Days"
+        elif timeframe == "month":
+            since = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            period_label = now.strftime("%B %Y")
+
+        query_or = [{"psychic_id": pid}]
+        if pemail:
+            query_or.append({"psychic_email": pemail})
+            query_or.append({"psychic_id": pemail})
+        query = {"$or": query_or, "status": "ended"}
+        if since:
+            query["ended_at"] = {"$gte": since}
+
+        sessions = await db.chat_sessions.find(query).sort("ended_at", -1).to_list(500)
+        period_gross = round(sum(float(s.get("total_cost", 0) or 0) for s in sessions), 2)
+        period_net = round(sum(float(s.get("psychic_earnings", 0) or 0) for s in sessions), 2)
+        platform_fee = round(period_gross - period_net, 2)
+
+        # Tips
+        tips_query = {"$or": query_or}
+        if since:
+            tips_query["created_at"] = {"$gte": since}
+        tips = await db.tips.find(tips_query).sort("created_at", -1).to_list(100)
+        period_tips = round(sum(float(t.get("amount", 0) or 0) for t in tips), 2)
+        total_net_with_tips = round(period_net + period_tips, 2)
+
+        available_balance = round(float(psychic.get("available_balance", 0) or 0), 2)
+
+        # Build table rows
+        rows_html = ""
+        for s in sessions:
+            ended_at = s.get("ended_at")
+            date_str = ended_at.strftime("%b %d, %Y %H:%M") if isinstance(ended_at, datetime) else str(ended_at or "")[:16]
+            stype = (s.get("session_type") or "Chat").title()
+            dur = s.get("duration_seconds", 0)
+            dur_str = f"{dur // 60}m {dur % 60}s"
+            client = s.get("client_name") or "Client"
+            gross = float(s.get("total_cost", 0) or 0)
+            net = float(s.get("psychic_earnings", 0) or 0)
+            rows_html += f"""
+            <tr>
+                <td>{date_str}</td>
+                <td><span class="badge">{stype}</span></td>
+                <td>{client}</td>
+                <td>{dur_str}</td>
+                <td style="text-align: right;">${gross:.2f}</td>
+                <td style="text-align: right; font-weight: bold; color: #10b981;">+${net:.2f}</td>
+            </tr>
+            """
+
+        for t in tips:
+            t_date = t.get("created_at")
+            t_date_str = t_date.strftime("%b %d, %Y %H:%M") if isinstance(t_date, datetime) else str(t_date or "")[:16]
+            t_amt = float(t.get("amount", 0) or 0)
+            t_client = t.get("client_name") or "Client"
+            rows_html += f"""
+            <tr>
+                <td>{t_date_str}</td>
+                <td><span class="badge" style="background:#e11d48; color:white;">Tip 🎁</span></td>
+                <td>{t_client}</td>
+                <td>-</td>
+                <td style="text-align: right;">${t_amt:.2f}</td>
+                <td style="text-align: right; font-weight: bold; color: #10b981;">+${t_amt:.2f}</td>
+            </tr>
+            """
+
+        if not rows_html:
+            rows_html = "<tr><td colspan='6' style='text-align: center; padding: 24px; color: #666;'>No reading sessions completed in this period.</td></tr>"
+
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>SixthSense Earnings Statement - {name}</title>
+            <style>
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                    color: #1f2937;
+                    background-color: #f9fafb;
+                    margin: 0;
+                    padding: 24px;
+                    line-height: 1.5;
+                }}
+                .print-bar {{
+                    max-width: 800px;
+                    margin: 0 auto 20px;
+                    display: flex;
+                    justify-content: flex-end;
+                    gap: 12px;
+                }}
+                .print-btn {{
+                    background: #8b5cf6;
+                    color: white;
+                    border: none;
+                    padding: 10px 20px;
+                    border-radius: 8px;
+                    font-weight: 600;
+                    cursor: pointer;
+                    font-size: 14px;
+                }}
+                .statement-card {{
+                    background: #ffffff;
+                    max-width: 800px;
+                    margin: 0 auto;
+                    border-radius: 12px;
+                    padding: 36px;
+                    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+                    border: 1px solid #e5e7eb;
+                }}
+                .header {{
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: flex-start;
+                    border-bottom: 2px solid #8b5cf6;
+                    padding-bottom: 20px;
+                    margin-bottom: 24px;
+                }}
+                .brand {{
+                    font-size: 26px;
+                    font-weight: 900;
+                    color: #8b5cf6;
+                    letter-spacing: -0.5px;
+                }}
+                .doc-title {{
+                    font-size: 18px;
+                    font-weight: 700;
+                    color: #111827;
+                    text-align: right;
+                }}
+                .meta {{
+                    font-size: 13px;
+                    color: #6b7280;
+                    text-align: right;
+                }}
+                .info-grid {{
+                    display: grid;
+                    grid-template-columns: 1fr 1fr;
+                    gap: 16px;
+                    margin-bottom: 24px;
+                    font-size: 14px;
+                }}
+                .summary-grid {{
+                    display: grid;
+                    grid-template-columns: repeat(4, 1fr);
+                    gap: 12px;
+                    margin-bottom: 28px;
+                }}
+                .summary-box {{
+                    background: #f3f4f6;
+                    border-radius: 8px;
+                    padding: 14px;
+                    text-align: center;
+                }}
+                .summary-label {{
+                    font-size: 11px;
+                    text-transform: uppercase;
+                    color: #6b7280;
+                    font-weight: 600;
+                    margin-bottom: 4px;
+                }}
+                .summary-val {{
+                    font-size: 18px;
+                    font-weight: 800;
+                    color: #111827;
+                }}
+                table {{
+                    width: 100%;
+                    border-collapse: collapse;
+                    font-size: 13px;
+                    margin-bottom: 24px;
+                }}
+                th {{
+                    background: #f9fafb;
+                    color: #4b5563;
+                    text-align: left;
+                    padding: 10px 12px;
+                    border-bottom: 1px solid #e5e7eb;
+                    font-weight: 600;
+                }}
+                td {{
+                    padding: 10px 12px;
+                    border-bottom: 1px solid #f3f4f6;
+                }}
+                .badge {{
+                    background: #ede9fe;
+                    color: #7c3aed;
+                    padding: 3px 8px;
+                    border-radius: 12px;
+                    font-size: 11px;
+                    font-weight: 600;
+                }}
+                .footer {{
+                    font-size: 12px;
+                    color: #9ca3af;
+                    text-align: center;
+                    border-top: 1px solid #e5e7eb;
+                    padding-top: 16px;
+                }}
+                @media print {{
+                    body {{ background: white; padding: 0; }}
+                    .print-bar {{ display: none; }}
+                    .statement-card {{ box-shadow: none; border: none; padding: 0; }}
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="print-bar">
+                <button class="print-btn" onclick="window.print()">🖨️ Print / Save as PDF</button>
+            </div>
+            <div class="statement-card">
+                <div class="header">
+                    <div>
+                        <div class="brand">✨ SixthSense</div>
+                        <div style="font-size: 13px; color: #6b7280;">Psychic Advisory Platform</div>
+                    </div>
+                    <div>
+                        <div class="doc-title">EARNINGS STATEMENT</div>
+                        <div class="meta">Period: <strong>{period_label}</strong></div>
+                        <div class="meta">Generated: {now.strftime("%B %d, %Y")}</div>
+                    </div>
+                </div>
+
+                <div class="info-grid">
+                    <div>
+                        <div style="color: #6b7280; font-size: 12px;">ADVISOR DETAILS</div>
+                        <div style="font-weight: 700; font-size: 16px; color: #111827;">{name}</div>
+                        <div style="color: #4b5563;">ID: {pid}</div>
+                        <div style="color: #4b5563;">Email: {pemail or 'N/A'}</div>
+                    </div>
+                    <div style="text-align: right;">
+                        <div style="color: #6b7280; font-size: 12px;">AVAILABLE FOR PAYOUT</div>
+                        <div style="font-weight: 800; font-size: 24px; color: #10b981;">${available_balance:.2f}</div>
+                        <div style="color: #6b7280; font-size: 12px;">Revenue Split: 40% Advisor / 60% Platform</div>
+                    </div>
+                </div>
+
+                <div class="summary-grid">
+                    <div class="summary-box">
+                        <div class="summary-label">Sessions</div>
+                        <div class="summary-val">{len(sessions)}</div>
+                    </div>
+                    <div class="summary-box">
+                        <div class="summary-label">Gross Revenue</div>
+                        <div class="summary-val">${period_gross:.2f}</div>
+                    </div>
+                    <div class="summary-box">
+                        <div class="summary-label">Platform Fee (60%)</div>
+                        <div class="summary-val" style="color: #ef4444;">-${platform_fee:.2f}</div>
+                    </div>
+                    <div class="summary-box">
+                        <div class="summary-label">Net Earnings (40%)</div>
+                        <div class="summary-val" style="color: #10b981;">${total_net_with_tips:.2f}</div>
+                    </div>
+                </div>
+
+                <div style="font-size: 14px; font-weight: 700; color: #111827; margin-bottom: 12px;">
+                    Itemized Session & Tip Activity
+                </div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Date & Time</th>
+                            <th>Service</th>
+                            <th>Client</th>
+                            <th>Duration</th>
+                            <th style="text-align: right;">Gross</th>
+                            <th style="text-align: right;">Advisor Net</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {rows_html}
+                    </tbody>
+                </table>
+
+                <div class="footer">
+                    Official financial statement generated by SixthSense Platform. For questions or support, contact support@sixthsense.com.
+                </div>
+            </div>
+            <script>
+                // Auto trigger print dialog on load
+                window.onload = function() {{
+                    setTimeout(function() {{
+                        window.print();
+                    }}, 600);
+                }};
+            </script>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=html_content)
     
     @router.post("/webhook")
     async def stripe_webhook(request: Request):

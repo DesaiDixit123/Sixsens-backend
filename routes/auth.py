@@ -596,16 +596,46 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
         if update_data:
             update_data["updated_at"] = datetime.utcnow()
             
-            # Update in psychics collection
+            # Update in psychics collection (support id, email, or ObjectId)
             result = await db.psychics.update_one(
-                {"id": psychic_id},
+                {"$or": [{"id": psychic_id}, {"email": psychic_id}]},
                 {"$set": update_data}
             )
+            if result.matched_count == 0:
+                try:
+                    from bson.objectid import ObjectId
+                    if len(psychic_id) == 24:
+                        await db.psychics.update_one({"_id": ObjectId(psychic_id)}, {"$set": update_data})
+                except Exception:
+                    pass
             
+            # Sync to in-memory MOCK_PSYCHICS so client app reflects changes immediately
+            try:
+                from routes.psychics import MOCK_PSYCHICS
+                alias_ids = [psychic_id]
+                psychic_doc = await db.psychics.find_one({"$or": [{"id": psychic_id}, {"email": psychic_id}]})
+                if psychic_doc and psychic_doc.get("email"):
+                    alias_ids.append(psychic_doc["email"])
+                
+                for mp in MOCK_PSYCHICS:
+                    if (
+                        mp.get("id") in alias_ids
+                        or mp.get("email") in alias_ids
+                        or (psychic_id in ("64ea86f6-968a-4dfc-8c98-1a322fb020c0", "testpsychic@sixthsense.com") and mp.get("id") == "psy-001")
+                    ):
+                        if "profile_picture" in update_data and update_data["profile_picture"]:
+                            mp["profile_picture"] = update_data["profile_picture"]
+                        if "name" in update_data and update_data["name"]:
+                            mp["name"] = update_data["name"]
+                        if "bio" in update_data and update_data["bio"]:
+                            mp["bio"] = update_data["bio"]
+                            mp["description"] = update_data["bio"]
+            except Exception as e:
+                print(f"Error syncing MOCK_PSYCHICS in update_psychic_profile: {e}")
+
             # Also update the profile picture in the linked client app user if it exists
-            # This syncs the profile picture across both apps
             if "profile_picture" in update_data:
-                psychic = await db.psychics.find_one({"id": psychic_id})
+                psychic = await db.psychics.find_one({"$or": [{"id": psychic_id}, {"email": psychic_id}]})
                 if psychic and psychic.get("email"):
                     await db.users.update_one(
                         {"email": psychic["email"]},

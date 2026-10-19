@@ -763,6 +763,19 @@ def create_psychic_routes(db: AsyncIOMotorDatabase):
                         mp["offers_video_call"] = offers_video
                         mp["offers_standard_readings"] = offers_standard
                         mp["offers_emergency_readings"] = offers_emergency
+                        if dbp.get("profile_picture"):
+                            mp["profile_picture"] = dbp["profile_picture"]
+                        if dbp.get("name"):
+                            mp["name"] = dbp["name"]
+                        if dbp.get("bio") or dbp.get("description"):
+                            mp["description"] = dbp.get("description") or dbp.get("bio")
+                            mp["about_me"] = dbp.get("about_me") or dbp.get("bio")
+                        if dbp.get("specialties"):
+                            mp["specialties"] = dbp["specialties"]
+                        if dbp.get("topics"):
+                            mp["topics"] = dbp["topics"]
+                        if dbp.get("years_experience"):
+                            mp["years_experience"] = dbp["years_experience"]
                         if dbp.get("chat_rate"):
                             mp["chat_rate"] = dbp["chat_rate"]
                         if dbp.get("phone_rate"):
@@ -916,6 +929,27 @@ def create_psychic_routes(db: AsyncIOMotorDatabase):
                     p["offers_phone"] = is_online and bool(db_psychic.get("offers_phone", True))
                     p["offers_video"] = is_online and bool(db_psychic.get("offers_video", db_psychic.get("offers_video_call", True)))
                     p["offers_video_call"] = p["offers_video"]
+                    if db_psychic.get("profile_picture"):
+                        p["profile_picture"] = db_psychic["profile_picture"]
+                    if db_psychic.get("name"):
+                        p["name"] = db_psychic["name"]
+                    if db_psychic.get("bio") or db_psychic.get("description"):
+                        p["description"] = db_psychic.get("description") or db_psychic.get("bio")
+                        p["about_me"] = db_psychic.get("about_me") or db_psychic.get("bio")
+                    if db_psychic.get("specialties"):
+                        p["specialties"] = db_psychic["specialties"]
+                    if db_psychic.get("topics"):
+                        p["topics"] = db_psychic["topics"]
+                    if db_psychic.get("years_experience"):
+                        p["years_experience"] = db_psychic["years_experience"]
+                    if db_psychic.get("chat_rate"):
+                        p["chat_rate"] = db_psychic["chat_rate"]
+                    if db_psychic.get("phone_rate"):
+                        p["phone_rate"] = db_psychic["phone_rate"]
+                    if db_psychic.get("video_rate") or db_psychic.get("video_call_rate"):
+                        v_rate = db_psychic.get("video_rate") or db_psychic.get("video_call_rate")
+                        p["video_rate"] = v_rate
+                        p["video_call_rate"] = v_rate
                 else:
                     is_online = p.get("online_status", "online") == "online"
                     p["offers_chat"] = is_online and bool(p.get("offers_chat", True))

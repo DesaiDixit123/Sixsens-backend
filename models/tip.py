@@ -16,5 +16,7 @@ class Tip(BaseModel):
 class TipCreate(BaseModel):
     psychic_id: str
     amount: float
-    message: str = ""
+    user_id: Optional[str] = None
+    client_name: Optional[str] = None
+    message: Optional[str] = ""
     session_id: Optional[str] = None

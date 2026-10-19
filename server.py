@@ -391,10 +391,15 @@ async def get_active_sale_public():
 # Include the main router
 app.include_router(api_router)
 
-# Mount static files for generated images
+# Mount static files for generated images and uploads
 static_dir = ROOT_DIR / "static"
 if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+uploads_dir = ROOT_DIR / "uploads"
+uploads_dir.mkdir(parents=True, exist_ok=True)
+(uploads_dir / "videos").mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(uploads_dir)), name="uploads")
 
 # Include feature routers
 auth_router = create_auth_routes(db)
@@ -614,6 +619,15 @@ async def startup_event():
     """Start the scheduler and load deleted psychics when app starts"""
     # Load deleted psychic IDs from database
     await load_deleted_psychic_ids(db)
+
+    # Clean up any old sample video links so advisor can record real video
+    try:
+        await db.questions.update_many(
+            {"video_response_url": {"$regex": "commondatastorage|BigBuckBunny|test_mode_video"}},
+            {"$set": {"video_response_url": None, "status": "pending"}}
+        )
+    except Exception as e:
+        logger.error(f"Error resetting invalid video URLs: {e}")
     
     # Schedule notifications at 9 AM and 6 PM UTC daily
     scheduler.add_job(

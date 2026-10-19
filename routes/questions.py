@@ -45,6 +45,20 @@ def create_questions_routes(db):
                 birth_location=question.third_party_birth_location
             )
         
+        # Look up client name if possible
+        client_name = "Client"
+        if user_id and user_id != "guest":
+            user_doc = await db.users.find_one({"$or": [{"id": user_id}, {"email": user_id}]})
+            if user_doc:
+                client_name = user_doc.get("name") or user_doc.get("full_name") or user_doc.get("email", "Client")
+
+        # Also get psychic email if possible
+        psychic_email = None
+        if question.psychic_id:
+            psy_doc = await db.psychics.find_one({"$or": [{"id": question.psychic_id}, {"email": question.psychic_id}]})
+            if psy_doc:
+                psychic_email = psy_doc.get("email")
+
         # Create the question object
         new_question = Question(
             id=str(uuid.uuid4()),
@@ -53,6 +67,7 @@ def create_questions_routes(db):
             question_text=question.question_text,
             question_type=question.question_type,
             delivery_type=question.delivery_type,
+            client_video_url=question.client_video_url,
             is_third_party=question.is_third_party,
             third_party_details=third_party_details,
             price=price,
@@ -60,9 +75,28 @@ def create_questions_routes(db):
             status="pending"
         )
         
-        # Save to database
-        await db.questions.insert_one(new_question.dict())
+        # Save to database with enriched client & psychic info
+        q_data = new_question.dict()
+        q_data["client_name"] = client_name
+        q_data["created_at"] = datetime.utcnow()
+        q_data["client_video_url"] = question.client_video_url
+        q_data["has_video"] = bool(question.client_video_url)
+        q_data["video_url"] = question.client_video_url
+        if psychic_email:
+            q_data["psychic_email"] = psychic_email
+        if question.psychic_id in ("psy-001", "64ea86f6-968a-4dfc-8c98-1a322fb020c0"):
+            q_data["psychic_email"] = "testpsychic@sixthsense.com"
+
+        await db.questions.insert_one(q_data)
         
+        # Trigger real-time notifications, push, and WebSocket for advisor
+        try:
+            from routes.reading_service import notify_advisor_new_reading
+            await notify_advisor_new_reading(db, q_data)
+        except Exception as notif_err:
+            import logging
+            logging.getLogger(__name__).warning(f"Failed to notify advisor of new reading: {notif_err}")
+
         return QuestionResponse(**new_question.dict())
     
     @router.get("/client/{client_id}", response_model=List[QuestionResponse])
@@ -90,6 +124,19 @@ def create_questions_routes(db):
         if not question:
             raise HTTPException(status_code=404, detail="Question not found")
         return QuestionResponse(**question)
+
+    @router.post("/{question_id}/answer")
+    async def answer_question(question_id: str, video_url: str = None, body: dict = None):
+        """Submit answer for a question, credit advisor earnings, and notify both parties"""
+        target_video_url = video_url
+        if not target_video_url and body and isinstance(body, dict):
+            target_video_url = body.get("video_url")
+
+        from routes.reading_service import process_reading_completion
+        updated_q = await process_reading_completion(db, question_id, target_video_url)
+        if not updated_q:
+            raise HTTPException(status_code=404, detail="Question not found")
+        return {"success": True, "video_response_url": target_video_url}
     
     @router.post("/{question_id}/clarification")
     async def send_clarification_message(

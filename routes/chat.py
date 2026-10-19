@@ -1031,8 +1031,8 @@ def create_chat_routes(db):
                 "id": str(uuid.uuid4()),
                 "user_id": psychic_id,
                 "user_type": "psychic",
-                "type": "reading_update",
-                "notification_type": "reading",
+                "type": "earning",
+                "notification_type": "earning",
                 "related_id": session_id,
                 "title": "Session Completed 💰",
                 "body": f"Session with {client_name} ended ({duration_seconds // 60}m {duration_seconds % 60}s). Client charged ${total_cost:.2f} • Your earnings: +${psychic_earnings:.2f}.",
@@ -1048,6 +1048,19 @@ def create_chat_routes(db):
                     "created_at": now_utc.isoformat(),
                 }
             }, psychic_id)
+
+            # Trigger push notification to advisor's device
+            try:
+                from routes.push_notifications import send_push_to_user
+                await send_push_to_user(
+                    db=db,
+                    user_id=psychic_id,
+                    title="Session Completed 💰",
+                    body=f"Session with {client_name} ended. Your earnings: +${psychic_earnings:.2f}!",
+                    data={"type": "earning", "session_id": session_id, "amount": str(psychic_earnings)}
+                )
+            except Exception as pe:
+                print(f"Error sending session end push notification: {pe}")
         except Exception as e:
             print(f"Error saving advisor session end notification: {e}")
 

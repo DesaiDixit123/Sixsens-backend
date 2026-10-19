@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import uuid
 
 class PsychicApplication(BaseModel):
@@ -39,12 +39,15 @@ class PsychicApplication(BaseModel):
 class PsychicDashboard(BaseModel):
     """Psychic dashboard stats"""
     total_earnings: float = 0
-    pending_earnings: float = 0
+    available_balance: float = 0
+    today_earnings: float = 0
+    weekly_earnings: float = 0
     total_readings: int = 0
     average_rating: float = 0
     total_reviews: int = 0
     pending_questions: int = 0
     active_sessions: int = 0
+    daily_breakdown: List[Dict[str, Any]] = []
 
 class PsychicSettings(BaseModel):
     """Psychic profile settings"""

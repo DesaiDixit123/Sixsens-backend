@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from typing import Optional
 from datetime import datetime
 import uuid
@@ -7,11 +7,82 @@ import base64
 import os
 from pathlib import Path
 
-# For now, we'll store images as base64 in MongoDB
-# This can be upgraded to S3/GCS later
+# Storage configuration
+UPLOAD_DIR = Path(__file__).parent.parent / "uploads"
+VIDEO_DIR = UPLOAD_DIR / "videos"
+VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 
 def create_storage_routes(db):
     router = APIRouter(prefix="/storage", tags=["storage"])
+
+    @router.post("/upload-video")
+    async def upload_video(
+        file: UploadFile = File(...),
+        question_id: Optional[str] = Form(default=None),
+        user_id: Optional[str] = Form(default=None)
+    ):
+        """Upload advisor reading video directly to disk for smooth streaming"""
+        file_id = str(uuid.uuid4())
+        ext = file.filename.split(".")[-1] if file.filename and "." in file.filename else "mp4"
+        if ext.lower() not in ["mp4", "mov", "m4v", "webm", "3gp"]:
+            ext = "mp4"
+        
+        filename = f"{file_id}.{ext}"
+        target_path = VIDEO_DIR / filename
+
+        # Write in chunks
+        with open(target_path, "wb") as f:
+            while chunk := await file.read(1024 * 1024):
+                f.write(chunk)
+
+        file_size = target_path.stat().st_size
+        base_url = os.getenv("BACKEND_URL", "http://192.168.29.227:8000")
+        video_url = f"{base_url}/api/storage/video/{filename}"
+
+        await db.files.insert_one({
+            "id": file_id,
+            "filename": filename,
+            "original_name": file.filename,
+            "content_type": f"video/{ext}",
+            "file_type": "video",
+            "path": str(target_path),
+            "size": file_size,
+            "question_id": question_id,
+            "user_id": user_id,
+            "created_at": datetime.utcnow()
+        })
+
+        return {
+            "success": True,
+            "file_id": file_id,
+            "url": video_url,
+            "filename": filename,
+            "size": file_size
+        }
+
+    @router.get("/video/{filename}")
+    async def get_video(filename: str):
+        """Serve video directly with HTTP range request support for mobile players"""
+        target_path = VIDEO_DIR / filename
+        if not target_path.exists():
+            file_id = filename.split(".")[0]
+            matched = list(VIDEO_DIR.glob(f"{file_id}.*"))
+            if matched:
+                target_path = matched[0]
+            else:
+                raise HTTPException(status_code=404, detail="Video file not found")
+
+        ext = target_path.suffix.lstrip(".").lower()
+        content_type = f"video/{ext}" if ext in ["mp4", "webm", "quicktime"] else "video/mp4"
+
+        return FileResponse(
+            target_path,
+            media_type=content_type,
+            headers={
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "public, max-age=86400"
+            }
+        )
     
     @router.get("/generated/{filename}")
     async def get_generated_file(filename: str):
@@ -106,23 +177,33 @@ def create_storage_routes(db):
         }
     
     @router.get("/file/{file_id}")
-    async def get_file(file_id: str):
-        """Retrieve a file by ID"""
+    async def get_file(file_id: str, format: Optional[str] = None):
+        """Retrieve a file by ID (serves binary image directly for React Native Image and web browsers)"""
         file_doc = await db.files.find_one({"id": file_id})
         if not file_doc:
             raise HTTPException(status_code=404, detail="File not found")
         
-        # Return as data URL for images
-        content_type = file_doc.get("content_type", "application/octet-stream")
+        content_type = file_doc.get("content_type", "image/jpeg")
         data = file_doc.get("data", "")
         
-        return {
-            "file_id": file_id,
-            "content_type": content_type,
-            "data_url": f"data:{content_type};base64,{data}",
-            "filename": file_doc.get("original_name"),
-            "size": file_doc.get("size")
-        }
+        if format == "json":
+            return {
+                "file_id": file_id,
+                "content_type": content_type,
+                "data_url": f"data:{content_type};base64,{data}",
+                "filename": file_doc.get("original_name"),
+                "size": file_doc.get("size")
+            }
+
+        try:
+            image_bytes = base64.b64decode(data)
+            return Response(
+                content=image_bytes,
+                media_type=content_type,
+                headers={"Cache-Control": "public, max-age=86400"}
+            )
+        except Exception:
+            raise HTTPException(status_code=500, detail="Error decoding file")
     
     @router.delete("/file/{file_id}")
     async def delete_file(file_id: str, user_id: str):
