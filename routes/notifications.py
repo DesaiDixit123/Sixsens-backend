@@ -64,50 +64,61 @@ PROMOTIONAL_MESSAGES = [
 ]
 
 def create_notifications_routes(db):
-    
+    from routes.websocket import expand_user_aliases
+
     @router.get("/user/{user_id}")
     async def get_user_notifications(user_id: str, user_type: str = None, limit: int = 50):
-        """Get notifications for a user"""
-        query = {"user_id": user_id}
+        """Get notifications for a user (including alias IDs)"""
+        target_ids = expand_user_aliases(user_id)
+        query = {"user_id": {"$in": target_ids}}
         if user_type:
-            query["user_type"] = user_type
+            query["$or"] = [
+                {"user_type": user_type},
+                {"user_type": {"$exists": False}},
+                {"user_type": None},
+            ]
             
         notifications = await db.notifications.find(query).sort("created_at", -1).limit(limit).to_list(limit)
         
-        # Convert MongoDB documents to clean dicts
         clean_notifications = []
         for n in notifications:
             clean_n = {k: v for k, v in n.items() if k != '_id'}
+            clean_n["is_read"] = bool(clean_n.get("is_read", clean_n.get("read", False)))
+            if "created_at" in clean_n and hasattr(clean_n["created_at"], "isoformat"):
+                clean_n["created_at"] = clean_n["created_at"].isoformat()
             clean_notifications.append(clean_n)
         
         return {"notifications": clean_notifications}
     
     @router.post("/mark-read/{notification_id}")
+    @router.post("/{notification_id}/read")
     async def mark_notification_read(notification_id: str):
         """Mark a notification as read"""
-        result = await db.notifications.update_one(
+        await db.notifications.update_one(
             {"id": notification_id},
-            {"$set": {"is_read": True}}
+            {"$set": {"is_read": True, "read": True}}
         )
-        if result.modified_count == 0:
-            raise HTTPException(status_code=404, detail="Notification not found")
         return {"success": True}
     
     @router.post("/mark-all-read/{user_id}")
-    async def mark_all_read(user_id: str):
+    @router.post("/user/{user_id}/read-all")
+    async def mark_all_read(user_id: str, user_type: str = None):
         """Mark all notifications as read for a user"""
+        target_ids = expand_user_aliases(user_id)
         await db.notifications.update_many(
-            {"user_id": user_id, "is_read": False},
-            {"$set": {"is_read": True}}
+            {"user_id": {"$in": target_ids}},
+            {"$set": {"is_read": True, "read": True}}
         )
         return {"success": True}
     
     @router.get("/unread-count/{user_id}")
     async def get_unread_count(user_id: str, user_type: str = None):
         """Get unread notification count for a user"""
-        query = {"user_id": user_id, "is_read": False}
-        if user_type:
-            query["user_type"] = user_type
+        target_ids = expand_user_aliases(user_id)
+        query = {
+            "user_id": {"$in": target_ids},
+            "is_read": {"$ne": True},
+        }
         count = await db.notifications.count_documents(query)
         return {"count": count}
     

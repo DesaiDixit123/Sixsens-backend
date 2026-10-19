@@ -14,18 +14,22 @@ class UserCreate(BaseModel):
     password: str
     name: str
     birth_date: Optional[str] = None
+    fcm_token: Optional[str] = None
 
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
+    fcm_token: Optional[str] = None
 
 class User(UserBase):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     profile_picture: Optional[str] = None
     balance: float = 0.0
-    status: str = "active"  # active, suspended, banned
+    free_credits: float = 0.0
+    status: str = "active"  # active, suspended, banned`x`x
     created_at: datetime = Field(default_factory=datetime.utcnow)
     saved_payment_methods: List[dict] = []
+    fcm_token: Optional[str] = None
     # Free 5-min reward tracking for loyal clients ($100+ spent)
     total_spent: float = 0.0  # Total amount spent on readings
     spending_progress: float = 0.0  # Progress towards next $100 milestone (0-100)
@@ -47,7 +51,9 @@ class UserResponse(BaseModel):
     zodiac_sign: Optional[str] = None
     profile_picture: Optional[str] = None
     balance: float
+    free_credits: float = 0.0
     status: str
+    fcm_token: Optional[str] = None
     # Free 5-min reward tracking for loyal clients
     total_spent: float = 0.0
     spending_progress: float = 0.0

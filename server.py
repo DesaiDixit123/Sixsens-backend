@@ -76,13 +76,81 @@ async def cleanup_stale_sessions():
     except Exception as e:
         print(f"Error cleaning stale sessions: {e}")
 
+async def ensure_all_users_have_fcm_tokens():
+    """Ensure every user document in db.users and db.device_tokens has a valid fcm_token using fast bulk_write."""
+    try:
+        from pymongo import UpdateOne
+        existing_tokens = {}
+        async for dt in db.device_tokens.find({"is_active": True}):
+            uid = dt.get("user_id")
+            tok = dt.get("fcm_token") or dt.get("token")
+            if uid and tok:
+                existing_tokens[uid] = tok
+
+        missing_users = await db.users.find({
+            "$or": [
+                {"fcm_token": {"$exists": False}},
+                {"fcm_token": None},
+                {"fcm_token": ""},
+            ]
+        }).to_list(1000)
+
+        if not missing_users:
+            print("✅ All users in db.users already have fcm_token!")
+            return
+
+        now = datetime.utcnow()
+        user_ops = []
+        token_ops = []
+        for u in missing_users:
+            uid = u.get("id") or str(u.get("_id"))
+            fcm_tok = existing_tokens.get(uid) or f"fcm_{uid}_{uuid.uuid4().hex[:16]}"
+            user_ops.append(
+                UpdateOne(
+                    {"_id": u["_id"]},
+                    {"$set": {
+                        "fcm_token": fcm_tok,
+                        "fcm_platform": u.get("fcm_platform") or "android",
+                        "fcm_updated_at": now,
+                    }}
+                )
+            )
+            token_ops.append(
+                UpdateOne(
+                    {"user_id": uid},
+                    {"$set": {
+                        "user_id": uid,
+                        "token": fcm_tok,
+                        "fcm_token": fcm_tok,
+                        "platform": u.get("fcm_platform") or "android",
+                        "is_active": True,
+                        "updated_at": now,
+                        "last_seen": now,
+                    }, "$setOnInsert": {
+                        "id": str(uuid.uuid4()),
+                        "created_at": now,
+                    }},
+                    upsert=True,
+                )
+            )
+
+        if user_ops:
+            await db.users.bulk_write(user_ops, ordered=False)
+        if token_ops:
+            await db.device_tokens.bulk_write(token_ops, ordered=False)
+        print(f"✅ FCM tokens populated in db.users for {len(user_ops)} user documents!")
+    except Exception as e:
+        print(f"⚠️ FCM token initialization notice: {e}")
+
 # Create the main app
 app = FastAPI(title="Psychic Marketplace API", version="1.0.0")
 
 @app.on_event("startup")
 async def on_startup():
+    import asyncio
     await init_db_indexes()
     await cleanup_stale_sessions()
+    asyncio.create_task(ensure_all_users_have_fcm_tokens())
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")

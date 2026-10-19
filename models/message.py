@@ -16,9 +16,12 @@ class Message(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 class MessageCreate(BaseModel):
-    receiver_id: str
+    receiver_id: Optional[str] = None
     content: str
     image_url: Optional[str] = None  # Base64 image data or URL
+    conversation_id: Optional[str] = None
+    sender_id: Optional[str] = None
+    sender_type: Optional[str] = None
 
 class MessageResponse(BaseModel):
     id: str
@@ -65,10 +68,10 @@ class ConversationResponse(BaseModel):
 class Notification(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str
-    user_type: str  # 'client' or 'psychic'
+    user_type: str = "psychic"  # 'client' or 'psychic'
     title: str
     body: str
-    notification_type: str  # 'message', 'reading', 'tip', etc.
+    notification_type: str = "message"  # 'message', 'reading', 'tip', etc.
     related_id: Optional[str] = None  # conversation_id, question_id, etc.
     is_read: bool = False
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -76,10 +79,10 @@ class Notification(BaseModel):
 class NotificationResponse(BaseModel):
     id: str
     user_id: str
-    user_type: str
+    user_type: Optional[str] = "psychic"
     title: str
     body: str
-    notification_type: str
+    notification_type: Optional[str] = "message"
     related_id: Optional[str] = None
-    is_read: bool
+    is_read: bool = False
     created_at: datetime

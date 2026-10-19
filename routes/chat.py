@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from typing import List
-from datetime import datetime
+from datetime import datetime, timedelta
 import uuid
 import sys
 import os
@@ -109,43 +109,113 @@ def create_chat_routes(db):
     router = APIRouter(prefix="/chat", tags=["chat"])
     
     # Helper function to send push notification to psychic
-    async def notify_psychic_of_request(psychic_id: str, psychic_email: str, client_name: str, session_type: str):
-        """Send push notification to psychic about incoming request"""
+    async def notify_psychic_of_request(
+        psychic_id: str,
+        psychic_email: str,
+        client_name: str,
+        session_type: str,
+        request_id: str = "",
+        rate: float = 2.99,
+        minutes: int = 5,
+        client_type: str = "NEW CLIENT",
+    ):
+        """Send push notification (FCM + Expo) & save in-app notification to psychic about incoming request"""
         try:
-            # Find psychic's push tokens
-            tokens = await db.device_tokens.find({
-                "$or": [
-                    {"user_id": psychic_id},
-                    {"user_id": psychic_email}
-                ],
-                "is_active": True
-            }).to_list(10)
-            
-            if not tokens:
-                print(f"[PUSH] No tokens found for psychic {psychic_id}")
-                return
-            
-            # Send notification via FCM or Emergent push
-            for token_doc in tokens:
-                try:
-                    # Log the notification attempt
-                    print(f"[PUSH] Sending to psychic {psychic_id}: {client_name} wants {session_type}")
-                    
-                    # Store notification in DB for the advisor app to poll
-                    notification = {
-                        "id": str(uuid.uuid4()),
+            target_ids = [x for x in [psychic_id, psychic_email] if x]
+            if psychic_id in ("psy-001", "64ea86f6-968a-4dfc-8c98-1a322fb020c0") or (psychic_email or "").lower() in ("testpsychic@sixthsense.com", "luna@psychic.com"):
+                for alias in ["psy-001", "64ea86f6-968a-4dfc-8c98-1a322fb020c0", "testpsychic@sixthsense.com", "luna@psychic.com"]:
+                    if alias not in target_ids:
+                        target_ids.append(alias)
+
+            # Store notification in DB for the advisor app
+            notif_id = str(uuid.uuid4())
+            now_utc = datetime.utcnow()
+            notification = {
+                "id": notif_id,
+                "user_id": psychic_id,
+                "user_type": "psychic",
+                "type": "reading",
+                "notification_type": "reading",
+                "related_id": request_id,
+                "title": "New Client Request! 🌟",
+                "body": f"{client_name} wants to start a {session_type} session with you (${rate}/min for {minutes} mins).",
+                "data": {
+                    "type": "session_request",
+                    "request_id": request_id,
+                    "session_type": session_type,
+                    "client_name": client_name,
+                    "client_type": client_type,
+                    "rate": str(rate),
+                    "minutes": str(minutes),
+                    "deeplink": f"/incoming-request?requestId={request_id}&clientName={client_name}&sessionType={session_type}&rate={rate}&minutes={minutes}"
+                },
+                "created_at": now_utc,
+                "is_read": False,
+                "read": False
+            }
+            await db.notifications.insert_one(notification)
+
+            try:
+                from routes.websocket import manager
+                await manager.send_personal_message({
+                    "type": "new_notification",
+                    "notification": {
+                        "id": notif_id,
                         "user_id": psychic_id,
-                        "title": "New Client Request! 🌟",
-                        "body": f"{client_name} wants to start a {session_type} session with you.",
-                        "data": {
-                            "type": "session_request",
-                            "session_type": session_type,
-                            "client_name": client_name
-                        },
-                        "created_at": datetime.utcnow(),
-                        "read": False
+                        "user_type": "psychic",
+                        "type": "reading",
+                        "notification_type": "reading",
+                        "title": notification["title"],
+                        "body": notification["body"],
+                        "is_read": False,
+                        "created_at": now_utc.isoformat(),
+                        "data": notification["data"],
                     }
-                    await db.notifications.insert_one(notification)
+                }, psychic_id)
+            except Exception as ws_err:
+                print(f"[WS NOTIF ERROR] {ws_err}")
+
+            # Collect all unique push tokens for this psychic
+            unique_tokens = []
+            tokens = await db.device_tokens.find({
+                "user_id": {"$in": target_ids},
+                "is_active": True
+            }).to_list(20)
+            for td in tokens:
+                tok = td.get("fcm_token") or td.get("token")
+                if tok and tok not in unique_tokens:
+                    unique_tokens.append(tok)
+
+            psy_docs = await db.psychics.find({
+                "$or": [{"id": {"$in": target_ids}}, {"email": {"$in": target_ids}}]
+            }).to_list(10)
+            for pd in psy_docs:
+                tok = pd.get("fcm_token")
+                if tok and tok not in unique_tokens:
+                    unique_tokens.append(tok)
+
+            usr_docs = await db.users.find({
+                "$or": [{"id": {"$in": target_ids}}, {"email": {"$in": target_ids}}]
+            }).to_list(10)
+            for ud in usr_docs:
+                tok = ud.get("fcm_token")
+                if tok and tok not in unique_tokens:
+                    unique_tokens.append(tok)
+
+            if not unique_tokens:
+                print(f"[PUSH] No tokens found for psychic {psychic_id} ({target_ids})")
+                return
+
+            from routes.push_notifications import send_firebase_token_push
+            for tok in unique_tokens:
+                try:
+                    print(f"[PUSH] Dispatching FCM push to psychic {psychic_id} ({tok[:25]}...): {client_name} wants {session_type}")
+                    await send_firebase_token_push(
+                        token=tok,
+                        title="New Client Request! 🌟",
+                        body=f"{client_name} wants to start a {session_type} session with you (${rate}/min).",
+                        data=notification["data"]
+                    )
                 except Exception as e:
                     print(f"[PUSH ERROR] {e}")
         except Exception as e:
@@ -158,8 +228,19 @@ def create_chat_routes(db):
         if not user_id:
             raise HTTPException(status_code=400, detail="User ID required")
         
-        # Get psychic's rate
+        # Get psychic from DB or MOCK_PSYCHICS
         psychic = await db.psychics.find_one({"id": session.psychic_id})
+        if not psychic and session.psychic_id == "psy-001":
+            psychic = await db.psychics.find_one({"email": {"$in": ["testpsychic@sixthsense.com", "luna@psychic.com"]}})
+        if not psychic:
+            try:
+                from routes.psychics import MOCK_PSYCHICS
+                for mp in MOCK_PSYCHICS:
+                    if mp.get("id") == session.psychic_id:
+                        psychic = mp
+                        break
+            except Exception:
+                pass
         if not psychic:
             # Try finding by email for test accounts
             psychic = await db.psychics.find_one({"email": {"$exists": True}})
@@ -171,8 +252,15 @@ def create_chat_routes(db):
             raise HTTPException(status_code=400, detail="Psychic is offline")
         
         # Get rate based on session type
-        rate_key = f"{session.session_type}_rate"
-        rate = psychic.get(rate_key) or psychic.get("rate_per_minute") or psychic.get("price_per_minute") or 2.99
+        s_type = (session.session_type or "chat").lower()
+        if s_type == "video":
+            rate = psychic.get("video_rate") or psychic.get("video_call_rate") or psychic.get("rate_per_minute") or 5.99
+        elif s_type in ("phone", "voice", "audio"):
+            rate = psychic.get("phone_rate") or psychic.get("rate_per_minute") or 4.99
+            s_type = "phone"
+        else:
+            rate = psychic.get("chat_rate") or psychic.get("rate_per_minute") or psychic.get("price_per_minute") or 2.99
+            s_type = "chat"
         
         # Determine whether client is NEW or RETURNING
         prior_sessions = await db.chat_sessions.count_documents({
@@ -182,38 +270,90 @@ def create_chat_routes(db):
         })
         client_type = "RETURNING CLIENT" if prior_sessions > 0 else "NEW CLIENT"
 
+        actual_psychic_id = psychic.get("id") or session.psychic_id
+        actual_psychic_email = psychic.get("email")
+
+        # Deduplication guard: if client already has a pending request created within last 15s, return it
+        existing_pending = await db.session_requests.find_one({
+            "client_id": user_id,
+            "status": "pending",
+            "$or": [{"psychic_id": actual_psychic_id}, {"requested_psychic_id": session.psychic_id}],
+            "created_at": {"$gte": datetime.utcnow() - timedelta(seconds=15)}
+        })
+        if existing_pending:
+            print(f"ℹ️ Returning existing pending session request to prevent duplicate: {existing_pending['id']}")
+            return {
+                "request_id": existing_pending["id"],
+                "status": "pending",
+                "message": "Session request sent to psychic",
+                "expires_in": 60
+            }
+
         # Create a pending session request
         request_id = str(uuid.uuid4())
+        now_dt = datetime.utcnow()
         session_request = {
             "id": request_id,
             "client_id": user_id,
             "client_name": user_name,
             "client_type": client_type,
-            "psychic_id": session.psychic_id,
-            "psychic_email": psychic.get("email"),
-            "session_type": session.session_type,
+            "psychic_id": actual_psychic_id,
+            "requested_psychic_id": session.psychic_id,
+            "psychic_email": actual_psychic_email,
+            "session_type": s_type,
             "rate_per_minute": rate,
             "requested_minutes": session.initial_minutes,
             "status": "pending",  # pending, accepted, rejected, expired
-            "created_at": datetime.utcnow(),
-            "expires_at": datetime.utcnow()  # 60 second timeout
+            "created_at": now_dt,
+            "expires_at": now_dt + timedelta(seconds=60)
         }
         
         await db.session_requests.insert_one(session_request)
         
+        # Immediately notify psychic via WebSocket for instant popup in Advisor App!
+        try:
+            from routes.websocket import manager
+            ws_req_payload = {
+                "type": "incoming_request",
+                "request_id": request_id,
+                "request": {
+                    "id": request_id,
+                    "client_id": user_id,
+                    "client_name": user_name,
+                    "client_type": client_type,
+                    "psychic_id": actual_psychic_id,
+                    "psychic_email": actual_psychic_email,
+                    "session_type": s_type,
+                    "rate_per_minute": rate,
+                    "requested_minutes": session.initial_minutes,
+                    "status": "pending",
+                    "created_at": now_dt.isoformat()
+                }
+            }
+            # send_personal_message automatically expands advisor aliases and deduplicates active sockets
+            await manager.send_personal_message(ws_req_payload, actual_psychic_id)
+            print(f"📲 Sent real-time incoming_request WS event ({s_type}) to advisor: {actual_psychic_id}")
+        except Exception as e:
+            print(f"Error sending WS incoming_request: {e}")
+
         # Send push notification to psychic in background
         background_tasks.add_task(
             notify_psychic_of_request,
-            session.psychic_id,
-            psychic.get("email"),
+            actual_psychic_id,
+            actual_psychic_email,
             user_name,
-            session.session_type
+            s_type,
+            request_id,
+            rate,
+            session.initial_minutes,
+            client_type
         )
         
         return {
             "success": True,
             "request_id": request_id,
             "status": "pending",
+            "session_type": s_type,
             "client_type": client_type,
             "message": "Waiting for advisor to accept..."
         }
@@ -225,33 +365,80 @@ def create_chat_routes(db):
         if not request:
             raise HTTPException(status_code=404, detail="Request not found")
         
+        session_id = request.get("session_id")
+        agora_channel = request.get("agora_channel")
+        agora_app_id = request.get("agora_app_id")
+        client_uid = request.get("client_uid")
+        psychic_uid = request.get("psychic_uid")
+        client_token = request.get("client_token")
+        psychic_token = request.get("psychic_token")
+
+        if request.get("status") == "accepted" and session_id and (not client_token or not client_uid):
+            session = await db.chat_sessions.find_one({"id": session_id})
+            if session:
+                agora_channel = agora_channel or session.get("agora_channel")
+                agora_app_id = agora_app_id or session.get("agora_app_id")
+                client_uid = client_uid or session.get("client_uid")
+                psychic_uid = psychic_uid or session.get("psychic_uid")
+                client_token = client_token or session.get("client_token")
+                psychic_token = psychic_token or session.get("psychic_token")
+        
         return {
             "request_id": request_id,
             "status": request.get("status"),
-            "session_id": request.get("session_id")
+            "session_id": session_id,
+            "session_type": request.get("session_type", "chat"),
+            "agora_channel": agora_channel,
+            "agora_app_id": agora_app_id,
+            "client_uid": client_uid,
+            "psychic_uid": psychic_uid,
+            "client_token": client_token,
+            "psychic_token": psychic_token,
         }
     
     @router.get("/requests/pending/{psychic_id}")
     async def get_pending_requests(psychic_id: str):
         """Get pending session requests for a psychic"""
-        # Also check by email for test accounts
         psychic = await db.psychics.find_one({"id": psychic_id})
         email = psychic.get("email") if psychic else None
         
-        query = {"status": "pending"}
+        or_clauses = [{"psychic_id": psychic_id}, {"requested_psychic_id": psychic_id}]
         if email:
-            query["$or"] = [{"psychic_id": psychic_id}, {"psychic_email": email}]
-        else:
-            query["psychic_id"] = psychic_id
+            or_clauses.append({"psychic_email": email})
+        if psychic_id in ("psy-001", "64ea86f6-968a-4dfc-8c98-1a322fb020c0") or (email or "").lower() in ("testpsychic@sixthsense.com", "luna@psychic.com"):
+            or_clauses.extend([
+                {"psychic_id": "psy-001"},
+                {"psychic_id": "64ea86f6-968a-4dfc-8c98-1a322fb020c0"},
+                {"requested_psychic_id": "psy-001"},
+                {"psychic_email": "testpsychic@sixthsense.com"},
+                {"psychic_email": "luna@psychic.com"},
+            ])
         
+        now = datetime.utcnow()
+        # Auto-expire stale pending requests
+        await db.session_requests.update_many(
+            {
+                "status": "pending",
+                "$or": [
+                    {"expires_at": {"$lt": now}},
+                    {"created_at": {"$lt": now - timedelta(seconds=60)}}
+                ]
+            },
+            {"$set": {"status": "expired"}}
+        )
+
+        query = {
+            "status": "pending",
+            "$or": or_clauses,
+            "created_at": {"$gte": now - timedelta(seconds=60)}
+        }
         requests = await db.session_requests.find(query).sort("created_at", -1).to_list(10)
         
-        # Convert ObjectId to string for JSON serialization
         for req in requests:
             req["_id"] = str(req["_id"])
-            if "created_at" in req:
+            if "created_at" in req and hasattr(req["created_at"], "isoformat"):
                 req["created_at"] = req["created_at"].isoformat()
-            if "expires_at" in req:
+            if "expires_at" in req and hasattr(req["expires_at"], "isoformat"):
                 req["expires_at"] = req["expires_at"].isoformat()
         
         return {"requests": requests}
@@ -259,29 +446,81 @@ def create_chat_routes(db):
     @router.get("/requests/pending/email/{email}")
     async def get_pending_requests_by_email(email: str):
         """Get pending session requests for a psychic by email"""
+        now = datetime.utcnow()
+        # Auto-expire stale pending requests
+        await db.session_requests.update_many(
+            {
+                "status": "pending",
+                "$or": [
+                    {"expires_at": {"$lt": now}},
+                    {"created_at": {"$lt": now - timedelta(seconds=60)}}
+                ]
+            },
+            {"$set": {"status": "expired"}}
+        )
+
+        email_lower = email.lower().strip()
+        or_clauses = [{"psychic_email": email}, {"psychic_email": email_lower}]
+        if email_lower in ("testpsychic@sixthsense.com", "luna@psychic.com"):
+            or_clauses.extend([
+                {"psychic_email": "testpsychic@sixthsense.com"},
+                {"psychic_email": "luna@psychic.com"},
+                {"psychic_id": "psy-001"},
+                {"psychic_id": "64ea86f6-968a-4dfc-8c98-1a322fb020c0"},
+                {"requested_psychic_id": "psy-001"},
+            ])
+        
         requests = await db.session_requests.find({
-            "psychic_email": email,
-            "status": "pending"
+            "status": "pending",
+            "$or": or_clauses,
+            "created_at": {"$gte": now - timedelta(seconds=60)}
         }).sort("created_at", -1).to_list(10)
         
         for req in requests:
             req["_id"] = str(req["_id"])
-            if "created_at" in req:
+            if "created_at" in req and hasattr(req["created_at"], "isoformat"):
                 req["created_at"] = req["created_at"].isoformat()
-            if "expires_at" in req:
+            if "expires_at" in req and hasattr(req["expires_at"], "isoformat"):
                 req["expires_at"] = req["expires_at"].isoformat()
         
         return {"requests": requests}
     
     @router.put("/request/{request_id}/accept")
     async def accept_session_request(request_id: str):
-        """Advisor accepts a session request"""
+        """Advisor accepts a session request (supports chat, phone, video with Agora tokens)"""
         request = await db.session_requests.find_one({"id": request_id})
         if not request:
             raise HTTPException(status_code=404, detail="Request not found")
         
+        if request.get("status") == "accepted" and request.get("session_id"):
+            existing_session = await db.chat_sessions.find_one({"id": request["session_id"]})
+            if existing_session:
+                existing_session["_id"] = str(existing_session.get("_id", ""))
+                return {
+                    "success": True,
+                    "session_id": request["session_id"],
+                    "session": existing_session,
+                    "agora_channel": existing_session.get("agora_channel"),
+                    "agora_app_id": existing_session.get("agora_app_id"),
+                    "client_uid": existing_session.get("client_uid"),
+                    "psychic_uid": existing_session.get("psychic_uid"),
+                    "client_token": existing_session.get("client_token"),
+                    "psychic_token": existing_session.get("psychic_token"),
+                }
+
         if request.get("status") != "pending":
-            raise HTTPException(status_code=400, detail="Request is no longer pending")
+            created_at = request.get("created_at")
+            is_recent = False
+            if request.get("status") == "expired" and created_at:
+                try:
+                    if isinstance(created_at, str):
+                        created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                    if isinstance(created_at, datetime):
+                        is_recent = (datetime.utcnow() - created_at.replace(tzinfo=None)).total_seconds() < 90
+                except Exception:
+                    pass
+            if not is_recent:
+                raise HTTPException(status_code=400, detail="Request is no longer pending")
         
         # Create the actual session
         psychic = await db.psychics.find_one({"id": request["psychic_id"]})
@@ -290,23 +529,74 @@ def create_chat_routes(db):
         
         rate = request.get("rate_per_minute", 2.99)
         initial_minutes = request.get("requested_minutes", 5)
+        s_type = request.get("session_type", "chat")
         
         new_session = ChatSession(
             client_id=request["client_id"],
             psychic_id=request["psychic_id"],
-            session_type=request["session_type"],
+            session_type=s_type,
             rate_per_minute=rate,
             auto_end_minutes=initial_minutes,
             total_cost=rate * initial_minutes
         )
         
-        await db.chat_sessions.insert_one(new_session.dict())
+        # Generate Agora RTC credentials for audio/video calls (and even available if switched in chat)
+        agora_channel = f"sixthsense_{new_session.id.replace('-', '')[:16]}"
+        client_uid = (abs(hash(str(request["client_id"]))) % 80000) + 1000
+        psychic_uid = (abs(hash(str(request["psychic_id"]))) % 80000) + 100000
+        try:
+            from routes.video import generate_agora_token, AGORA_APP_ID
+            agora_app_id = AGORA_APP_ID or "adff706fa53f45529d871c60da335b84"
+            # In Agora RTC, token built with uid=0 is a wildcard token valid for ANY integer uid (Astrology style)
+            wildcard_token = generate_agora_token(agora_channel, 0, 1)
+            client_token = wildcard_token or generate_agora_token(agora_channel, client_uid, 1)
+            psychic_token = wildcard_token or generate_agora_token(agora_channel, psychic_uid, 1)
+        except Exception as agora_err:
+            print(f"[AGORA TOKEN ERROR] {agora_err}")
+            agora_app_id = os.getenv("AGORA_APP_ID", "adff706fa53f45529d871c60da335b84")
+            client_token = f"mock_token_{agora_channel}_{client_uid}"
+            psychic_token = f"mock_token_{agora_channel}_{psychic_uid}"
+
+        session_doc = new_session.dict()
+        session_doc["requested_psychic_id"] = request.get("requested_psychic_id", request["psychic_id"])
+        session_doc["psychic_email"] = request.get("psychic_email")
+        session_doc["client_name"] = request.get("client_name", "Client")
+        session_doc["agora_channel"] = agora_channel
+        session_doc["agora_app_id"] = agora_app_id
+        session_doc["client_uid"] = client_uid
+        session_doc["psychic_uid"] = psychic_uid
+        session_doc["client_token"] = client_token
+        session_doc["psychic_token"] = psychic_token
+        await db.chat_sessions.insert_one(session_doc)
+        if "_id" in session_doc:
+            session_doc["_id"] = str(session_doc["_id"])
         
-        # Update request status
+        # Update request status with Agora fields
         await db.session_requests.update_one(
             {"id": request_id},
-            {"$set": {"status": "accepted", "session_id": new_session.id}}
+            {"$set": {
+                "status": "accepted",
+                "session_id": new_session.id,
+                "agora_channel": agora_channel,
+                "agora_app_id": agora_app_id,
+                "client_uid": client_uid,
+                "psychic_uid": psychic_uid,
+                "client_token": client_token,
+                "psychic_token": psychic_token,
+            }}
         )
+        
+        # Mark client's first reading as used once a live session is accepted
+        if request.get("client_id"):
+            await db.users.update_one(
+                {"id": request["client_id"]},
+                {"$set": {
+                    "first_reading_free_used": True,
+                    "is_new_user": False,
+                    "free_credits": 0.0,
+                    "free_minutes_available": 0,
+                }}
+            )
         
         # Update psychic status to busy
         if psychic:
@@ -314,25 +604,74 @@ def create_chat_routes(db):
                 {"_id": psychic["_id"]},
                 {"$set": {"online_status": "busy"}}
             )
+
+        # Notify client immediately via WebSocket & broadcast busy status
+        try:
+            from routes.websocket import manager
+            if request.get("client_id"):
+                await manager.send_personal_message({
+                    "type": "request_accepted",
+                    "request_id": request_id,
+                    "session_id": new_session.id,
+                    "session_type": s_type,
+                    "psychic_id": request["psychic_id"],
+                    "agora_channel": agora_channel,
+                    "agora_app_id": agora_app_id,
+                    "client_uid": client_uid,
+                    "psychic_uid": psychic_uid,
+                    "client_token": client_token,
+                    "psychic_token": psychic_token,
+                }, request["client_id"])
+            await manager.broadcast({
+                "type": "psychic_status_changed",
+                "psychic_id": request["psychic_id"],
+                "alias_ids": [x for x in [request.get("psychic_id"), request.get("requested_psychic_id")] if x],
+                "email": request.get("psychic_email"),
+                "online_status": "busy",
+                "is_online": True,
+            })
+        except Exception as e:
+            print(f"Error sending accept WS notification: {e}")
         
         return {
             "success": True,
             "session_id": new_session.id,
-            "session": new_session.dict()
+            "session": session_doc,
+            "agora_channel": agora_channel,
+            "agora_app_id": agora_app_id,
+            "client_uid": client_uid,
+            "psychic_uid": psychic_uid,
+            "client_token": client_token,
+            "psychic_token": psychic_token,
         }
     
     @router.put("/request/{request_id}/reject")
     async def reject_session_request(request_id: str):
         """Advisor rejects a session request"""
-        result = await db.session_requests.update_one(
+        request = await db.session_requests.find_one({"id": request_id})
+        if not request:
+            return {"success": True, "status": "not_found"}
+        if request.get("status") != "pending":
+            # Already accepted, rejected, or cancelled - do not error on late timer
+            return {"success": True, "status": request.get("status")}
+
+        await db.session_requests.update_one(
             {"id": request_id, "status": "pending"},
             {"$set": {"status": "rejected"}}
         )
         
-        if result.modified_count == 0:
-            raise HTTPException(status_code=404, detail="Request not found or already processed")
-        
+        try:
+            from routes.websocket import manager
+            if request and request.get("client_id"):
+                await manager.send_personal_message({
+                    "type": "request_rejected",
+                    "request_id": request_id,
+                }, request["client_id"])
+        except Exception as e:
+            print(f"Error sending reject WS notification: {e}")
+
         return {"success": True, "status": "rejected"}
+
     
     @router.delete("/request/{request_id}")
     @router.post("/request/{request_id}/cancel")
@@ -556,89 +895,187 @@ def create_chat_routes(db):
         return {"success": True, "minutes_added": request.minutes, "additional_cost": additional_cost}
     
     @router.post("/end/{session_id}")
-    async def end_session(session_id: str, background_tasks: BackgroundTasks):
-        """End a chat session and notify both parties"""
+    async def end_session(session_id: str, background_tasks: BackgroundTasks, ended_by: str = "user"):
+        """End a chat session, deduct client wallet, credit advisor earnings, and notify both parties"""
         session = await db.chat_sessions.find_one({"id": session_id})
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
         
-        # Calculate final duration and cost
-        started_at = session.get("started_at", datetime.utcnow())
-        duration_minutes = (datetime.utcnow() - started_at).total_seconds() / 60
-        total_cost = duration_minutes * session.get("rate_per_minute", 2.99)
-        
+        from routes.websocket import manager
+
+        # Idempotent check if session was already ended
+        if session.get("status") == "ended":
+            return {
+                "success": True,
+                "already_ended": True,
+                "session_id": session_id,
+                "duration_seconds": session.get("duration_seconds", int(session.get("total_minutes", 1) * 60)),
+                "duration_minutes": session.get("total_minutes", 1.0),
+                "rate_per_minute": session.get("rate_per_minute", 2.99),
+                "total_cost": session.get("total_cost", 2.99),
+                "psychic_earnings": session.get("psychic_earnings", round(session.get("total_cost", 2.99) * 0.40, 2)),
+                "remaining_balance": session.get("remaining_balance", 0.0),
+                "ended_by": session.get("ended_by", ended_by),
+            }
+
+        now_utc = datetime.utcnow()
+        started_at = session.get("started_at", now_utc)
+        if isinstance(started_at, str):
+            try:
+                started_at = datetime.fromisoformat(started_at.replace("Z", ""))
+            except Exception:
+                started_at = now_utc
+
+        duration_seconds = max(1, int((now_utc - started_at).total_seconds()))
+        duration_minutes = round(duration_seconds / 60.0, 2)
+        rate = float(session.get("rate_per_minute", 2.99))
+
+        # Bill minimum 1 minute (or exact pro-rata minutes if > 1 minute) so every live session has a clear billable amount
+        billable_minutes = max(1.0, duration_minutes)
+        total_cost = round(billable_minutes * rate, 2)
+        psychic_earnings = round(total_cost * 0.40, 2)
+
+        client_id = session.get("client_id")
+        psychic_id = session.get("psychic_id")
+
+        # Deduct total_cost from client wallet balance in db.users
+        client = await db.users.find_one({"id": client_id}) if client_id else None
+        current_balance = float(client.get("balance", 0.0)) if client else 0.0
+        new_balance = round(max(0.0, current_balance - total_cost), 2)
+        if client_id and client:
+            await db.users.update_one(
+                {"id": client_id},
+                {"$set": {"balance": new_balance}}
+            )
+
         await db.chat_sessions.update_one(
             {"id": session_id},
             {
                 "$set": {
                     "status": "ended",
-                    "ended_at": datetime.utcnow(),
-                    "total_minutes": round(duration_minutes, 2),
-                    "total_cost": round(total_cost, 2)
+                    "ended_at": now_utc,
+                    "ended_by": ended_by,
+                    "duration_seconds": duration_seconds,
+                    "total_minutes": duration_minutes,
+                    "total_cost": total_cost,
+                    "psychic_earnings": psychic_earnings,
+                    "remaining_balance": new_balance,
                 }
             }
         )
-        
-        # Notify both parties via WebSocket that the session has ended
-        from routes.websocket import manager
-        client_id = session.get("client_id")
-        psychic_id = session.get("psychic_id")
-        
+
         end_message = {
             "type": "session_ended",
             "session_id": session_id,
-            "duration_minutes": round(duration_minutes, 2),
-            "total_cost": round(total_cost, 2),
-            "ended_by": "user"
+            "conversation_id": session_id,
+            "duration_seconds": duration_seconds,
+            "duration_minutes": duration_minutes,
+            "rate_per_minute": rate,
+            "total_cost": total_cost,
+            "psychic_earnings": psychic_earnings,
+            "remaining_balance": new_balance,
+            "ended_by": ended_by,
         }
-        
-        # Notify client
+
+        # Notify client, psychic (including all alias IDs), and conversation room
         if client_id:
             await manager.send_personal_message(end_message, client_id)
-        
-        # Notify psychic
         if psychic_id:
             await manager.send_personal_message(end_message, psychic_id)
-        
-        # Set psychic back to online
-        await db.psychics.update_one(
-            {"id": session.get("psychic_id")},
-            {"$set": {"online_status": "online"}}
+        await manager.broadcast_to_conversation(end_message, session_id)
+
+        # Set psychic back to online and credit earnings to both lifetime and available balance
+        await db.psychics.update_many(
+            {"$or": [{"id": psychic_id}, {"email": session.get("psychic_email")}]},
+            {
+                "$set": {"online_status": "online", "is_online": True, "offers_chat": True},
+                "$inc": {
+                    "total_earnings": psychic_earnings,
+                    "available_balance": psychic_earnings,
+                    "total_readings": 1,
+                },
+            }
         )
-        
-        # Update psychic earnings (40%)
-        psychic_earnings = total_cost * 0.40
-        await db.psychics.update_one(
-            {"id": session.get("psychic_id")},
-            {"$inc": {"total_earnings": psychic_earnings, "total_readings": 1}}
-        )
-        
-        # Send session receipt email to client
-        client = await db.users.find_one({"id": session.get("client_id")})
-        psychic = await db.psychics.find_one({"id": session.get("psychic_id")})
-        
+        if psychic_id:
+            try:
+                updated_psy = await db.psychics.find_one({"id": psychic_id}) or {}
+                await manager.send_personal_message({
+                    "type": "earnings_updated",
+                    "psychic_id": psychic_id,
+                    "session_id": session_id,
+                    "amount": psychic_earnings,
+                    "available_balance": round(float(updated_psy.get("available_balance", 0) or 0), 2),
+                    "total_earnings": round(float(updated_psy.get("total_earnings", 0) or 0), 2),
+                }, psychic_id)
+            except Exception as e:
+                print(f"Error sending earnings_updated: {e}")
+        try:
+            await manager.broadcast({
+                "type": "psychic_status_changed",
+                "psychic_id": psychic_id,
+                "alias_ids": [x for x in [psychic_id, session.get("requested_psychic_id"), "psy-001"] if x],
+                "online_status": "online",
+                "is_online": True,
+                "offers_chat": True,
+            })
+        except Exception as e:
+            print(f"Error broadcasting online status after session end: {e}")
+
+        # Create in-app notifications for both Advisor and Client
+        psychic = await db.psychics.find_one({"id": psychic_id})
+        client_name = (client.get("name") if client else None) or session.get("client_name") or "Client"
+        psychic_name = (psychic.get("name") if psychic else None) or "Your Advisor"
+
+        try:
+            adv_notif = {
+                "id": str(uuid.uuid4()),
+                "user_id": psychic_id,
+                "user_type": "psychic",
+                "type": "reading_update",
+                "notification_type": "reading",
+                "related_id": session_id,
+                "title": "Session Completed 💰",
+                "body": f"Session with {client_name} ended ({duration_seconds // 60}m {duration_seconds % 60}s). Client charged ${total_cost:.2f} • Your earnings: +${psychic_earnings:.2f}.",
+                "is_read": False,
+                "read": False,
+                "created_at": now_utc,
+            }
+            await db.notifications.insert_one(adv_notif)
+            await manager.send_personal_message({
+                "type": "new_notification",
+                "notification": {
+                    **{k: v for k, v in adv_notif.items() if k != "_id"},
+                    "created_at": now_utc.isoformat(),
+                }
+            }, psychic_id)
+        except Exception as e:
+            print(f"Error saving advisor session end notification: {e}")
+
         if client and client.get("email"):
             client_email = client.get("email")
-            client_name = client.get("name", client_email.split("@")[0])
-            psychic_name = psychic.get("name", "Your Advisor") if psychic else "Your Advisor"
             session_type = session.get("session_type", "chat")
-            session_date = datetime.utcnow().strftime("%B %d, %Y at %I:%M %p UTC")
-            
+            session_date = now_utc.strftime("%B %d, %Y at %I:%M %p UTC")
             background_tasks.add_task(
                 send_session_receipt_email_async,
                 client_email,
                 client_name,
                 psychic_name,
                 session_type,
-                round(duration_minutes, 2),
-                round(total_cost, 2),
+                duration_minutes,
+                total_cost,
                 session_date
             )
-        
+
         return {
             "success": True,
-            "duration_minutes": round(duration_minutes, 2),
-            "total_cost": round(total_cost, 2)
+            "session_id": session_id,
+            "duration_seconds": duration_seconds,
+            "duration_minutes": duration_minutes,
+            "rate_per_minute": rate,
+            "total_cost": total_cost,
+            "psychic_earnings": psychic_earnings,
+            "remaining_balance": new_balance,
+            "ended_by": ended_by,
         }
     
     @router.get("/{session_id}")
@@ -647,6 +1084,40 @@ def create_chat_routes(db):
         session = await db.chat_sessions.find_one({"id": session_id})
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Ensure Agora credentials exist for audio/video call
+        if not session.get("client_token") or not session.get("psychic_token"):
+            try:
+                from routes.video import generate_agora_token, AGORA_APP_ID
+                agora_channel = session.get("agora_channel") or f"sixthsense_{session_id.replace('-', '')[:16]}"
+                agora_app_id = session.get("agora_app_id") or AGORA_APP_ID or "adff706fa53f45529d871c60da335b84"
+                client_uid = session.get("client_uid") or ((abs(hash(str(session.get("client_id", "client")))) % 80000) + 1000)
+                psychic_uid = session.get("psychic_uid") or ((abs(hash(str(session.get("psychic_id", "psychic")))) % 80000) + 100000)
+                
+                wildcard_token = generate_agora_token(agora_channel, 0, 1)
+                c_tok = wildcard_token or generate_agora_token(agora_channel, client_uid, 1)
+                p_tok = wildcard_token or generate_agora_token(agora_channel, psychic_uid, 1)
+                
+                await db.chat_sessions.update_one(
+                    {"id": session_id},
+                    {"$set": {
+                        "agora_channel": agora_channel,
+                        "agora_app_id": agora_app_id,
+                        "client_uid": client_uid,
+                        "psychic_uid": psychic_uid,
+                        "client_token": c_tok,
+                        "psychic_token": p_tok,
+                    }}
+                )
+                session["agora_channel"] = agora_channel
+                session["agora_app_id"] = agora_app_id
+                session["client_uid"] = client_uid
+                session["psychic_uid"] = psychic_uid
+                session["client_token"] = c_tok
+                session["psychic_token"] = p_tok
+            except Exception as e:
+                print(f"Error ensuring Agora tokens in get_session: {e}")
+
         if "_id" in session:
             session["_id"] = str(session["_id"])
         return session
@@ -663,15 +1134,70 @@ def create_chat_routes(db):
                 s["_id"] = str(s["_id"])
         return sessions
     
+    @router.get("/sessions/client/{client_id}")
     @router.get("/history/{user_id}")
-    async def get_session_history(user_id: str, limit: int = 20):
-        """Get user's session history"""
+    async def get_client_sessions_history(client_id: str = None, user_id: str = None, limit: int = 50):
+        """Get client's session history with psychic details and last messages for History tab"""
+        cid = client_id or user_id or "client"
+        from routes.websocket import expand_user_aliases
+        target_ids = expand_user_aliases(cid)
+        
+        # Find all chat sessions for this client (or match client_id)
         sessions = await db.chat_sessions.find({
-            "client_id": user_id
+            "$or": [
+                {"client_id": {"$in": target_ids}},
+                {"client_id": cid},
+            ]
         }).sort("started_at", -1).to_list(limit)
+
+        # If empty and cid is guest/unknown, return recent sessions as fallback
+        if not sessions and cid in ("guest", "client", "unknown", ""):
+            sessions = await db.chat_sessions.find({}).sort("started_at", -1).to_list(limit)
+        
+        result = []
         for s in sessions:
             if "_id" in s:
                 s["_id"] = str(s["_id"])
-        return sessions
+            
+            psy_id = s.get("psychic_id")
+            psy = None
+            if psy_id:
+                psy = await db.psychics.find_one({"id": {"$in": expand_user_aliases(psy_id)}})
+            
+            # Find last message
+            messages = s.get("messages", [])
+            last_msg = ""
+            last_msg_time = s.get("created_at") or s.get("started_at")
+            if messages and len(messages) > 0:
+                last_item = messages[-1]
+                last_msg = last_item.get("message") or last_item.get("content") or ("[Photo]" if last_item.get("message_type") == "image" else "")
+                last_msg_time = last_item.get("timestamp") or last_msg_time
+            else:
+                db_msgs = await db.messages.find({"conversation_id": s["id"]}).sort("created_at", -1).to_list(1)
+                if db_msgs:
+                    m = db_msgs[0]
+                    last_msg = m.get("content") or ("[Photo]" if m.get("image_url") else "")
+                    last_msg_time = m.get("created_at")
+            
+            if not last_msg:
+                s_type = (s.get("session_type") or "chat").title()
+                last_msg = f"{s_type} Session"
+
+            psychic_name = (psy.get("name") if psy else s.get("psychic_name")) or "Psychic Advisor"
+            psychic_avatar = (psy.get("profile_picture") or psy.get("avatar") if psy else None) or "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150"
+
+            result.append({
+                "id": s["id"],
+                "psychic_id": psy_id or "",
+                "psychic_name": psychic_name,
+                "psychic_avatar": psychic_avatar,
+                "last_message": last_msg,
+                "last_message_time": str(last_msg_time) if last_msg_time else None,
+                "total_duration": s.get("duration_seconds") or (int(s.get("total_minutes") or s.get("auto_end_minutes") or 1) * 60),
+                "total_cost": float(s.get("total_cost") or 0.0),
+                "status": "completed" if s.get("status") in ("ended", "completed") else "active",
+                "created_at": str(s.get("created_at") or s.get("started_at") or datetime.utcnow().isoformat()),
+            })
+        return result
     
     return router

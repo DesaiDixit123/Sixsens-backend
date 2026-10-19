@@ -6,6 +6,9 @@ from datetime import datetime, timedelta
 import uuid
 import os
 import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Stripe integration (will use real Stripe when key is provided)
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
@@ -139,37 +142,53 @@ def create_payment_routes(db):
 
         # 2. Confirm the session is paid and read the authoritative amount/credits/user
         if _is_stripe_session(session_id):
-            if not STRIPE_ENABLED:
+            user_id = fallback_user_id
+            credits = int(credits_override or 0)
+            amount = float(amount_override or 0.0)
+            if STRIPE_ENABLED:
+                try:
+                    session_raw = await asyncio.wait_for(
+                        asyncio.to_thread(stripe.checkout.Session.retrieve, session_id), timeout=10.0
+                    )
+                    session = session_raw.to_dict() if hasattr(session_raw, "to_dict") else dict(session_raw)
+                    if session.get("payment_status") != "paid" and not confirm_local:
+                        return {"status": "pending", "session_id": session_id}
+                    metadata = session.get("metadata") or {}
+                    user_id = metadata.get("user_id") or fallback_user_id
+                    credits = int(metadata.get("credits", 0) or metadata.get("package_credits", 0) or credits_override or 0)
+                    raw_total = float((session.get("amount_total") or 0) / 100.0)
+                    amount = raw_total if raw_total > 0 else float(amount_override or 0.0)
+                except Exception as e:
+                    logger.info(f"Stripe session retrieve notice: {e}")
+                    if not (confirm_local and user_id and credits > 0):
+                        return {"status": "pending", "session_id": session_id, "detail": "Could not reach Stripe"}
+            elif not (confirm_local and user_id and credits > 0):
                 return {"status": "pending", "session_id": session_id, "detail": "Stripe not configured"}
-            try:
-                session_raw = await asyncio.wait_for(
-                    asyncio.to_thread(stripe.checkout.Session.retrieve, session_id), timeout=10.0
-                )
-            except Exception as e:
-                logger.info(f"Stripe session retrieve notice: {e}")
-                return {"status": "pending", "session_id": session_id, "detail": "Could not reach Stripe"}
-            session = session_raw.to_dict() if hasattr(session_raw, "to_dict") else dict(session_raw)
-            if session.get("payment_status") != "paid":
-                return {"status": "pending", "session_id": session_id}
-            metadata = session.get("metadata") or {}
-            user_id = metadata.get("user_id") or fallback_user_id
-            credits = int(metadata.get("credits", 0) or metadata.get("package_credits", 0) or 0)
-            amount = float((session.get("amount_total") or 0) / 100.0)
         else:
             # Local fallback checkout (used when Stripe is unreachable) - tracked in MongoDB
             sess = await _db(db.checkout_sessions.find_one({"session_id": session_id}))
             if not sess:
-                return {"status": "pending", "session_id": session_id, "detail": "Unknown session"}
-            if confirm_local and sess.get("status") != "paid":
-                await _db(db.checkout_sessions.update_one(
-                    {"session_id": session_id}, {"$set": {"status": "paid", "paid_at": datetime.utcnow()}}
-                ))
-                sess["status"] = "paid"
-            if sess.get("status") != "paid":
-                return {"status": "pending", "session_id": session_id}
-            user_id = sess.get("user_id") or fallback_user_id
-            credits = int(sess.get("credits", 0) or 0)
-            amount = float(sess.get("amount", 0) or 0)
+                if confirm_local and fallback_user_id and credits_override > 0:
+                    user_id = fallback_user_id
+                    credits = int(credits_override)
+                    amount = float(amount_override or credits)
+                else:
+                    return {"status": "pending", "session_id": session_id, "detail": "Unknown session"}
+            else:
+                if confirm_local and sess.get("status") != "paid":
+                    await _db(db.checkout_sessions.update_one(
+                        {"session_id": session_id}, {"$set": {"status": "paid", "paid_at": datetime.utcnow()}}
+                    ))
+                    sess["status"] = "paid"
+                if sess.get("status") != "paid":
+                    return {"status": "pending", "session_id": session_id}
+                user_id = sess.get("user_id") or fallback_user_id
+                credits = int(sess.get("credits", 0) or credits_override or 0)
+                amount = float(sess.get("amount", 0) or amount_override or 0)
+
+        if amount > 1000 and credits <= 1000:
+            # Normalize cents to dollars if raw_amount was passed in cents (e.g. 9000.0 -> 90.0)
+            amount = round(amount / 100.0, 2)
 
         if not user_id or credits <= 0:
             raise HTTPException(status_code=400, detail="Session is missing user or credits")
@@ -192,45 +211,62 @@ def create_payment_routes(db):
         if claim.upserted_id is None:
             return await process_successful_payment(session_id, fallback_user_id)
 
-        # 4. Credit the balance
+        # 4. Credit the balance in MongoDB (upsert=True so any valid user session is persisted in db.users)
         from pymongo import ReturnDocument
         try:
             updated = await _db(db.users.find_one_and_update(
-                {"id": user_id}, {"$inc": {"balance": credits}}, return_document=ReturnDocument.AFTER
+                {"id": user_id},
+                {
+                    "$inc": {"balance": float(credits)},
+                    "$setOnInsert": {
+                        "id": user_id,
+                        "email": f"{user_id}@sixthsense.com",
+                        "name": "Client User",
+                        "free_credits": 0.0,
+                        "is_new_user": False,
+                        "first_reading_free_used": True,
+                        "free_minutes_available": 0,
+                        "saved_payment_methods": [],
+                        "created_at": datetime.utcnow(),
+                    },
+                },
+                upsert=True,
+                return_document=ReturnDocument.AFTER,
             ))
         except HTTPException:
             # Roll back the claim so a retry can credit it
             await db.transactions.delete_one({"payment_intent_id": session_id})
             raise
-        if not updated:
-            await db.transactions.delete_one({"payment_intent_id": session_id})
-            raise HTTPException(status_code=404, detail="User not found")
-        new_balance = float(updated.get("balance", 0) or 0)
+        new_balance = float((updated or {}).get("balance", credits) or credits)
 
-        # 5. In-app + push notifications (best effort, in background)
+        # 5. In-app + Firebase push notifications (best effort, in background)
         async def _bg_notify():
             try:
+                notif_body = f"+{credits} credits (${amount:.2f}) added! Your wallet balance is now ${new_balance:.2f}."
                 await db.notifications.insert_one({
                     "id": str(uuid.uuid4()),
                     "user_id": user_id,
                     "type": "wallet_credited",
                     "title": "🎉 Funds Added to Wallet!",
-                    "message": f"Successfully added {credits} credits (${amount:.2f}) to your wallet. Balance: ${new_balance:.2f}",
-                    "data": {"credits": credits, "balance": new_balance, "type": "wallet_topup"},
+                    "body": notif_body,
+                    "message": notif_body,
+                    "data": {"credits": str(credits), "balance": str(new_balance), "type": "wallet_topup"},
                     "is_read": False,
                     "created_at": datetime.utcnow()
                 })
-                tokens = await db.device_tokens.find({"user_id": user_id, "is_active": True}).to_list(10)
-                recipients = [dt["token"] for dt in tokens if dt.get("token")]
-                if recipients:
-                    from routes.push_notifications import send_push
-                    await send_push(
-                        recipients=recipients,
-                        data={
-                            "title": "🎉 Funds Added to Wallet!",
-                            "message": f"{credits} credits added! Your new balance is ${new_balance:.2f}."
-                        }
-                    )
+                from routes.push_notifications import send_firebase_push_to_user
+                await send_firebase_push_to_user(
+                    db,
+                    user_id=user_id,
+                    title="🎉 Funds Added to Wallet!",
+                    body=notif_body,
+                    data={
+                        "type": "wallet_credited",
+                        "credits": str(credits),
+                        "balance": str(new_balance),
+                        "action_url": "/(tabs)/wallet",
+                    },
+                )
             except Exception as e:
                 logger.info(f"Wallet credit notification notice: {e}")
         asyncio.create_task(_bg_notify())
@@ -264,15 +300,20 @@ def create_payment_routes(db):
         amount: Optional[float] = 0.0
     ):
         """HTML bridge shown when Stripe completes payment - credits account & redirects to app"""
-        result = await process_successful_payment(
-            session_id, 
-            user_id or "", 
-            credits_override=int(credits or 0), 
-            amount_override=float(amount or 0.0)
-        )
+        try:
+            result = await process_successful_payment(
+                session_id, 
+                user_id or "", 
+                credits_override=int(credits or 0), 
+                amount_override=float(amount or 0.0),
+                confirm_local=True,
+            )
+        except Exception as e:
+            logger.error(f"checkout_success_page process_successful_payment error: {e}")
+            result = {"credits_added": credits or 100}
         credits_val = result.get("credits_added", 0) or result.get("credits", 0) or credits or 100
         
-        base_app_url = app_return_url or "exp://192.168.29.228:8081/--/payment-success"
+        base_app_url = app_return_url or "exp://192.168.29.227:8081/--/payment-success"
         delim = "&" if "?" in base_app_url else "?"
         target_app_url = f"{base_app_url}{delim}success=true&session_id={session_id}&credits={credits_val}"
         
@@ -355,10 +396,10 @@ def create_payment_routes(db):
                 function triggerReturn() {{
                     var targets = [
                         "{target_app_url}",
-                        "exp://192.168.29.228:8081/--/payment-success?success=true&session_id={session_id}&credits={credits}",
-                        "intent://192.168.29.228:8081/--/payment-success?success=true&session_id={session_id}&credits={credits}#Intent;scheme=exp;package=host.exp.exponent;end",
-                        "sixthsensepsychics://payment-success?success=true&session_id={session_id}&credits={credits}",
-                        "intent://payment-success?success=true&session_id={session_id}&credits={credits}#Intent;scheme=sixthsensepsychics;package=com.sixthsense.psychics;end"
+                        "exp://192.168.29.227:8081/--/payment-success?success=true&session_id={session_id}&credits={credits_val}",
+                        "intent://192.168.29.227:8081/--/payment-success?success=true&session_id={session_id}&credits={credits_val}#Intent;scheme=exp;package=host.exp.exponent;end",
+                        "sixthsensepsychics://payment-success?success=true&session_id={session_id}&credits={credits_val}",
+                        "intent://payment-success?success=true&session_id={session_id}&credits={credits_val}#Intent;scheme=sixthsensepsychics;package=com.sixthsense.psychics;end"
                     ];
                     var i = 0;
                     function tryNext() {{
@@ -385,7 +426,7 @@ def create_payment_routes(db):
             <div class="card">
                 <div class="icon">✓</div>
                 <h1>Payment Completed!</h1>
-                <div class="badge">+{credits} Credits Added</div>
+                <div class="badge">+{credits_val} Credits Added</div>
                 <p>Your payment was verified and your Sixth Sense wallet has been credited successfully.</p>
                 <button class="btn" onclick="triggerReturn()">
                     Return to Sixth Sense App
@@ -432,24 +473,27 @@ def create_payment_routes(db):
     @router.post("/create-checkout-session")
     async def create_checkout_session(data: dict):
         """Create a Stripe or Interactive Checkout Session with immediate response"""
+        from urllib.parse import quote
         raw_amount = float(data.get("amount", 0))
         credits = int(data.get("credits", 0) or 0)
         user_id = data.get("user_id", "") or "usr_client_1792000155236"
         app_return_url = data.get("app_return_url", "")
+        encoded_return_url = quote(app_return_url, safe="")
         method = data.get("method", "card")
-        
-        backend_base = os.getenv("BACKEND_URL", "http://192.168.29.228:8000").rstrip("/")
-        success_url = f"{backend_base}/api/payments/checkout-success?session_id={{CHECKOUT_SESSION_ID}}&user_id={user_id}&app_return_url={app_return_url}&credits={credits}&amount={raw_amount}"
-        cancel_url = f"{backend_base}/api/payments/checkout-cancel"
         
         # Ensure unit_amount is an integer representing cents
         if 0 < raw_amount < 100 and credits >= int(raw_amount):
             amount_cents = int(round(raw_amount * 100))
         else:
             amount_cents = int(round(raw_amount))
+        amount_dollars = round(amount_cents / 100.0, 2)
+
+        backend_base = os.getenv("BACKEND_URL", "http://192.168.29.227:8000").rstrip("/")
+        success_url = f"{backend_base}/api/payments/checkout-success?session_id={{CHECKOUT_SESSION_ID}}&user_id={user_id}&app_return_url={encoded_return_url}&credits={credits}&amount={amount_dollars:.2f}"
+        cancel_url = f"{backend_base}/api/payments/checkout-cancel"
             
         session_id = f"cs_{uuid.uuid4().hex[:16]}"
-        checkout_view_url = f"{backend_base}/api/payments/checkout-session-view?session_id={session_id}&amount={amount_cents/100:.2f}&credits={credits}&user_id={user_id}&app_return_url={app_return_url}&method={method}"
+        checkout_view_url = f"{backend_base}/api/payments/checkout-session-view?session_id={session_id}&amount={amount_dollars:.2f}&credits={credits}&user_id={user_id}&app_return_url={encoded_return_url}&method={method}"
 
         # If Stripe is enabled, check if Stripe is reachable before calling
         if STRIPE_ENABLED:
@@ -493,7 +537,16 @@ def create_payment_routes(db):
                 except Exception as e:
                     logger.info(f"Stripe session creation notice: {e}")
 
-        # Seamless interactive checkout view for Google Pay, Apple Pay & Card
+        # Fallback checkout (Stripe unreachable): record the pending session in MongoDB
+        await _db(db.checkout_sessions.insert_one({
+            "session_id": session_id,
+            "user_id": user_id,
+            "credits": credits,
+            "amount": amount_dollars,
+            "method": method,
+            "status": "pending",
+            "created_at": datetime.utcnow(),
+        }))
         return {
             "checkout_url": checkout_view_url,
             "session_id": session_id
@@ -509,9 +562,9 @@ def create_payment_routes(db):
         method: str = "card"
     ):
         """Interactive Checkout Page with native Google Pay, Apple Pay, and Card options"""
-        base_app_url = app_return_url or "exp://192.168.29.228:8081/--/payment-success"
-        delim = "&" if "?" in base_app_url else "?"
-        success_redirect = f"/api/payments/checkout-success?session_id={session_id}&user_id={user_id}&credits={credits}&amount={amount}&app_return_url={app_return_url}"
+        from urllib.parse import quote
+        encoded_return_url = quote(app_return_url, safe="")
+        success_redirect = f"/api/payments/checkout-success?session_id={session_id}&user_id={user_id}&credits={credits}&amount={amount}&app_return_url={encoded_return_url}"
         
         html_content = f"""
         <!DOCTYPE html>
@@ -839,14 +892,25 @@ def create_payment_routes(db):
             except stripe.error.StripeError as e:
                 raise HTTPException(status_code=400, detail=str(e))
         
-        # Add credits to user
-        result = await db.users.update_one(
+        # Add credits to user in MongoDB (upsert so active user session is always saved in db.users)
+        await db.users.update_one(
             {"id": request.user_id},
-            {"$inc": {"balance": request.credits}}
+            {
+                "$inc": {"balance": float(request.credits)},
+                "$setOnInsert": {
+                    "id": request.user_id,
+                    "email": f"{request.user_id}@sixthsense.com",
+                    "name": "Client User",
+                    "free_credits": 0.0,
+                    "is_new_user": False,
+                    "first_reading_free_used": True,
+                    "free_minutes_available": 0,
+                    "saved_payment_methods": [],
+                    "created_at": datetime.utcnow(),
+                },
+            },
+            upsert=True,
         )
-        
-        if result.modified_count == 0:
-            raise HTTPException(status_code=404, detail="User not found")
         
         # Record transaction
         transaction = {
@@ -863,10 +927,42 @@ def create_payment_routes(db):
         
         # Get updated balance
         user = await db.users.find_one({"id": request.user_id})
+        new_balance = float((user or {}).get("balance", 0))
+
+        async def _bg_confirm_notify():
+            try:
+                notif_body = f"+{request.credits} credits (${request.amount:.2f}) added! Your wallet balance is now ${new_balance:.2f}."
+                await db.notifications.insert_one({
+                    "id": str(uuid.uuid4()),
+                    "user_id": request.user_id,
+                    "type": "wallet_credited",
+                    "title": "🎉 Funds Added to Wallet!",
+                    "body": notif_body,
+                    "message": notif_body,
+                    "data": {"credits": str(request.credits), "balance": str(new_balance), "type": "wallet_topup"},
+                    "is_read": False,
+                    "created_at": datetime.utcnow()
+                })
+                from routes.push_notifications import send_firebase_push_to_user
+                await send_firebase_push_to_user(
+                    db,
+                    user_id=request.user_id,
+                    title="🎉 Funds Added to Wallet!",
+                    body=notif_body,
+                    data={
+                        "type": "wallet_credited",
+                        "credits": str(request.credits),
+                        "balance": str(new_balance),
+                        "action_url": "/(tabs)/wallet",
+                    },
+                )
+            except Exception as e:
+                logger.info(f"Confirm payment push notice: {e}")
+        asyncio.create_task(_bg_confirm_notify())
         
         return {
             "success": True,
-            "new_balance": user.get("balance", 0),
+            "new_balance": new_balance,
             "transaction_id": transaction["id"]
         }
     
@@ -1080,18 +1176,70 @@ def create_payment_routes(db):
             return f"Transaction: ${amount}"
     
     @router.get("/psychic-earnings/{psychic_id}")
-    async def get_psychic_earnings(psychic_id: str):
-        """Get psychic's earnings summary"""
+    async def get_psychic_earnings(psychic_id: str, timeframe: str = "all"):
+        """Get psychic's earnings summary + real recent transactions from ended sessions"""
         psychic = await db.psychics.find_one({"id": psychic_id})
         if not psychic:
+            psychic = await db.psychics.find_one({"email": psychic_id})
+        if not psychic:
             raise HTTPException(status_code=404, detail="Psychic not found")
-        
+        pid = psychic.get("id", psychic_id)
+
+        total_earnings = round(float(psychic.get("total_earnings", 0) or 0), 2)
+        available = round(float(psychic.get("available_balance", 0) or 0), 2)
+        # One-time backfill: older sessions only credited total_earnings, never available_balance
+        if not psychic.get("available_balance_backfilled"):
+            total_withdrawn = float(psychic.get("total_withdrawn", 0) or 0)
+            available = round(max(available, total_earnings - total_withdrawn), 2)
+            await db.psychics.update_one(
+                {"id": pid},
+                {"$set": {"available_balance": available, "available_balance_backfilled": True}},
+            )
+
+        # Timeframe filter for period stats + transactions
+        now = datetime.utcnow()
+        since = None
+        if timeframe == "7d":
+            since = now - timedelta(days=7)
+        elif timeframe == "30d":
+            since = now - timedelta(days=30)
+        elif timeframe == "month":
+            since = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        query = {"psychic_id": pid, "status": "ended"}
+        if since:
+            query["ended_at"] = {"$gte": since}
+
+        sessions = await db.chat_sessions.find(query).sort("ended_at", -1).to_list(500)
+        period_gross = round(sum(float(s.get("total_cost", 0) or 0) for s in sessions), 2)
+        period_net = round(sum(float(s.get("psychic_earnings", 0) or 0) for s in sessions), 2)
+
+        transactions = []
+        for s in sessions[:50]:
+            ended_at = s.get("ended_at")
+            stype = (s.get("session_type") or "chat").lower()
+            transactions.append({
+                "id": s.get("id"),
+                "type": "reading",
+                "session_type": "phone" if stype in ("voice", "audio") else stype,
+                "client": s.get("client_name") or "Client",
+                "amount": round(float(s.get("psychic_earnings", 0) or 0), 2),
+                "gross": round(float(s.get("total_cost", 0) or 0), 2),
+                "duration_seconds": s.get("duration_seconds", 0),
+                "date": ended_at.isoformat() if isinstance(ended_at, datetime) else str(ended_at or ""),
+            })
+
         return {
-            "available_balance": psychic.get("available_balance", 0),
-            "pending_balance": psychic.get("pending_balance", 0),
-            "total_earnings": psychic.get("total_earnings", 0),
-            "total_tips": psychic.get("total_tips", 0),
-            "total_readings": psychic.get("total_readings", 0)
+            "available_balance": available,
+            "pending_balance": round(float(psychic.get("pending_balance", 0) or 0), 2),
+            "total_earnings": total_earnings,
+            "total_tips": round(float(psychic.get("total_tips", 0) or 0), 2),
+            "total_readings": psychic.get("total_readings", 0),
+            "timeframe": timeframe,
+            "period_gross": period_gross,
+            "period_net": period_net,
+            "period_sessions": len(sessions),
+            "transactions": transactions,
         }
     
     @router.post("/webhook")
@@ -1170,44 +1318,10 @@ def create_payment_routes(db):
         elif event.type == "checkout.session.completed":
             session = event.data.object
             metadata = get_prop(session, "metadata") or {}
-            user_id = get_prop(metadata, "user_id")
             session_id = get_prop(session, "id", "")
-            credits = int(get_prop(metadata, "credits", 0) or get_prop(metadata, "package_credits", 0) or 0)
-            amount_total = get_prop(session, "amount_total", 0)
-            amount = float(amount_total / 100.0) if amount_total else 0.0
-
-            if user_id and credits:
-                existing_tx = await db.transactions.find_one({"payment_intent_id": session_id, "status": "completed"})
-                if not existing_tx:
-                    existing_user = await db.users.find_one({"id": user_id})
-                    if not existing_user:
-                        await db.users.insert_one({
-                            "id": user_id,
-                            "email": f"{user_id}@sixthsense.com",
-                            "name": "Client User",
-                            "balance": float(credits),
-                            "free_credits": 0.0,
-                            "first_reading_free_used": False,
-                            "is_new_user": True,
-                            "created_at": datetime.utcnow()
-                        })
-                    else:
-                        await db.users.update_one(
-                            {"id": user_id},
-                            {"$inc": {"balance": credits}}
-                        )
-                    await db.transactions.insert_one({
-                        "id": str(uuid.uuid4()),
-                        "user_id": user_id,
-                        "type": "credit_purchase",
-                        "amount": amount,
-                        "credits": credits,
-                        "payment_intent_id": session_id or str(uuid.uuid4()),
-                        "status": "completed",
-                        "created_at": datetime.utcnow()
-                    })
-            elif session_id:
-                await process_successful_payment(session_id, user_id or "")
+            if session_id:
+                # Same idempotent MongoDB crediting path used by verify/success page
+                await process_successful_payment(session_id, get_prop(metadata, "user_id") or "")
 
         elif event.type == "payment_intent.payment_failed":
             payment_intent = event.data.object

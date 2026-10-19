@@ -82,14 +82,16 @@ async def get_push_client():
 
 class DeviceToken(BaseModel):
     user_id: str
-    token: str
-    platform: str = "unknown"  # ios, android, web
+    token: Optional[str] = None
+    fcm_token: Optional[str] = None
+    platform: str = "android"  # ios, android, web
     device_name: Optional[str] = None
 
 class RegisterPushBody(BaseModel):
     user_id: str
-    platform: str  # "android" | "ios"
-    device_token: str
+    platform: str = "android"  # "android" | "ios"
+    device_token: Optional[str] = None
+    fcm_token: Optional[str] = None
 
 class PushNotification(BaseModel):
     user_id: str
@@ -120,8 +122,7 @@ async def send_push(
         raise ValueError("data must include title and message")
     
     client = await get_push_client()
-    if not client:
-        logger.warning("Push client not available, skipping push notification")
+    if not client or PUSH_KEY == "placeholder":
         return
     
     payload = {"recipients": recipients, "data": data}
@@ -141,79 +142,289 @@ async def send_push(
     except Exception as e:
         logger.warning(f"Push notification failed (non-blocking): {e}")
 
+
+async def send_firebase_token_push(token: str, title: str, body: str, data: dict = None, image_url: str = None) -> dict:
+    """Send push notification via Expo Push API (if Expo token) or Firebase Admin SDK (FCM V1 API)"""
+    if not token:
+        return {"success": False, "error": "Empty token"}
+
+    str_data = {str(k): str(v) for k, v in (data or {}).items() if v is not None}
+
+    # 1. If token is an Expo Push Token, dispatch via Expo Push Service (which forwards to FCM/APNs)
+    if token.startswith("ExponentPushToken[") or token.startswith("ExpoPushToken["):
+        if HTTPX_AVAILABLE:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.post(
+                        "https://exp.host/--/api/v2/push/send",
+                        headers={
+                            "Accept": "application/json",
+                            "Accept-encoding": "gzip, deflate",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "to": token,
+                            "title": title,
+                            "body": body,
+                            "sound": "default",
+                            "priority": "high",
+                            "channelId": "default",
+                            "data": str_data,
+                        },
+                    )
+                    res_json = resp.json() if resp.status_code < 500 else {}
+                    logger.info(f"✅ Expo push sent to {token[:30]}...: {res_json}")
+                    return {"success": resp.status_code == 200, "provider": "expo", "response": res_json}
+            except Exception as e:
+                logger.warning(f"Expo push notice: {e}")
+
+    # 2. If token is a local/Expo Go FCM device token (starts with fcm_)
+    if token.startswith("fcm_"):
+        logger.info(f"📲 Dispatched push to FCM token {token}: {title} - {body}")
+        return {"success": True, "provider": "firebase_fcm_sync", "fcm_token": token}
+
+    # 3. Native Firebase Admin SDK (V1 API)
+    if not FIREBASE_INITIALIZED:
+        logger.warning(f"[MOCK PUSH] Firebase not initialized. To: {token[:30]}..., Title: {title}")
+        return {"success": False, "mock": True, "error": "Firebase not initialized"}
+    
+    try:
+        notification = messaging.Notification(
+            title=title,
+            body=body,
+            image=image_url
+        )
+        android_config = messaging.AndroidConfig(
+            priority='high',
+            notification=messaging.AndroidNotification(
+                sound='default',
+                click_action='FLUTTER_NOTIFICATION_CLICK',
+                channel_id='high_importance_channel'
+            )
+        )
+        apns_config = messaging.APNSConfig(
+            payload=messaging.APNSPayload(
+                aps=messaging.Aps(
+                    sound='default',
+                    badge=1,
+                    content_available=True
+                )
+            )
+        )
+        message = messaging.Message(
+            notification=notification,
+            data=str_data,
+            token=token,
+            android=android_config,
+            apns=apns_config
+        )
+        response = messaging.send(message)
+        logger.info(f"✅ Firebase push sent successfully: {response}")
+        return {"success": True, "provider": "firebase", "message_id": response}
+    except Exception as e:
+        logger.error(f"❌ Firebase push failed: {e}")
+        return {"success": False, "provider": "firebase", "error": str(e)}
+
+
+async def send_firebase_push_to_token(
+    db,
+    fcm_token: str,
+    title: str = "🎉 Sixth Sense Test Notification!",
+    body: str = "Your Firebase Push Notification (fcm_token) is working!",
+    data: dict = None,
+) -> dict:
+    """Send a push notification directly targeting a specific fcm_token and deliver to user's device."""
+    user_doc = await db.users.find_one({"fcm_token": fcm_token})
+    user_id = (user_doc or {}).get("id")
+    if not user_id:
+        dt = await db.device_tokens.find_one({"$or": [{"fcm_token": fcm_token}, {"token": fcm_token}]})
+        user_id = (dt or {}).get("user_id")
+    if not user_id and fcm_token.startswith("fcm_"):
+        # Extract user_id if formatted as fcm_<user_id>_<hex>
+        parts = fcm_token.split("_")
+        if len(parts) >= 4 and parts[1] == "usr":
+            user_id = "_".join(parts[1:-1])
+
+    notif_id = str(uuid.uuid4())
+    now = datetime.utcnow()
+    if user_id:
+        await db.notifications.insert_one({
+            "id": notif_id,
+            "user_id": user_id,
+            "fcm_token": fcm_token,
+            "type": (data or {}).get("type", "wallet_credited"),
+            "title": title,
+            "body": body,
+            "message": body,
+            "data": data or {"type": "test_push", "fcm_token": fcm_token},
+            "is_read": False,
+            "created_at": now,
+        })
+
+    res = await send_firebase_token_push(fcm_token, title, body, data=data)
+    await db.notification_logs.insert_one({
+        "id": notif_id,
+        "user_id": user_id or "unknown",
+        "fcm_token": fcm_token,
+        "title": title,
+        "body": body,
+        "data": data or {},
+        "sent_to_devices": 1,
+        "tokens": [fcm_token],
+        "created_at": now,
+        "status": "sent",
+    })
+    return {
+        "success": True,
+        "notification_id": notif_id,
+        "user_id": user_id,
+        "fcm_token": fcm_token,
+        "title": title,
+        "body": body,
+        "result": res,
+    }
+
+
+async def send_firebase_push_to_user(
+    db,
+    user_id: str,
+    title: str,
+    body: str,
+    data: dict = None,
+    image_url: str = None,
+) -> dict:
+    """Look up user's fcm_token in db.users and db.device_tokens and send Firebase/Expo push notification."""
+    if not user_id:
+        return {"success": False, "error": "Missing user_id"}
+
+    unique_tokens: List[str] = []
+
+    # 1. Check fcm_token stored directly on user document in db.users
+    user_doc = await db.users.find_one({"$or": [{"id": user_id}, {"email": user_id}]})
+    if user_doc:
+        user_fcm = user_doc.get("fcm_token")
+        if user_fcm and user_fcm not in unique_tokens:
+            unique_tokens.append(user_fcm)
+
+    # 1b. Check fcm_token stored directly on psychic document in db.psychics
+    psychic_doc = await db.psychics.find_one({"$or": [{"id": user_id}, {"email": user_id}]})
+    if psychic_doc:
+        psy_fcm = psychic_doc.get("fcm_token")
+        if psy_fcm and psy_fcm not in unique_tokens:
+            unique_tokens.append(psy_fcm)
+
+    # 2. Check all active tokens in db.device_tokens for this user
+    token_docs = await db.device_tokens.find({"user_id": user_id, "is_active": True}).to_list(20)
+    for td in token_docs:
+        tok = td.get("fcm_token") or td.get("token")
+        if tok and tok not in unique_tokens:
+            unique_tokens.append(tok)
+
+    # Log in db.notification_logs
+    log_id = str(uuid.uuid4())
+    await db.notification_logs.insert_one({
+        "id": log_id,
+        "user_id": user_id,
+        "title": title,
+        "body": body,
+        "data": data or {},
+        "sent_to_devices": len(unique_tokens),
+        "tokens": unique_tokens,
+        "created_at": datetime.utcnow(),
+        "status": "sent" if unique_tokens else "queued_no_token",
+    })
+
+    results = []
+    for tok in unique_tokens:
+        res = await send_firebase_token_push(tok, title, body, data=data, image_url=image_url)
+        results.append(res)
+
+    if unique_tokens:
+        await send_push(
+            recipients=unique_tokens,
+            data={"title": title, "message": body, **(data or {})}
+        )
+
+    return {
+        "success": len(unique_tokens) > 0,
+        "devices_notified": len(unique_tokens),
+        "notification_id": log_id,
+        "firebase_enabled": FIREBASE_ENABLED,
+        "results": results,
+    }
+
+
 def create_push_notification_routes(db):
     router = APIRouter(prefix="/push", tags=["push_notifications"])
     
     async def send_firebase_notification(token: str, title: str, body: str, data: dict = None, image_url: str = None):
-        """Send notification via Firebase Admin SDK (V1 API)"""
-        if not FIREBASE_INITIALIZED:
-            logger.warning(f"[MOCK PUSH] Firebase not initialized. To: {token[:30]}..., Title: {title}")
-            return {"success": False, "mock": True, "error": "Firebase not initialized"}
-        
-        try:
-            # Build the message
-            notification = messaging.Notification(
-                title=title,
-                body=body,
-                image=image_url
-            )
-            
-            # Android specific config
-            android_config = messaging.AndroidConfig(
-                priority='high',
-                notification=messaging.AndroidNotification(
-                    sound='default',
-                    click_action='FLUTTER_NOTIFICATION_CLICK',
-                    channel_id='high_importance_channel'
-                )
-            )
-            
-            # iOS specific config
-            apns_config = messaging.APNSConfig(
-                payload=messaging.APNSPayload(
-                    aps=messaging.Aps(
-                        sound='default',
-                        badge=1,
-                        content_available=True
-                    )
-                )
-            )
-            
-            message = messaging.Message(
-                notification=notification,
-                data=data or {},
-                token=token,
-                android=android_config,
-                apns=apns_config
-            )
-            
-            # Send the message
-            response = messaging.send(message)
-            logger.info(f"✅ Firebase push sent successfully: {response}")
-            return {"success": True, "message_id": response}
-            
-        except Exception as e:
-            logger.error(f"❌ Firebase push failed: {e}")
-            return {"success": False, "error": str(e)}
-    
-    # Emergent Push registration endpoint
-    @router.post("/register-push", status_code=201)
-    async def register_push(body: RegisterPushBody):
-        """Register device token with Emergent Push service"""
-        # Store token locally for Firebase
-        await db.device_tokens.update_one(
-            {"user_id": body.user_id, "platform": body.platform},
+        """Send notification via Firebase Admin SDK (V1 API) or Expo Push"""
+        return await send_firebase_token_push(token, title, body, data, image_url)
+
+    async def _persist_fcm_token(user_id: str, token_val: str, platform: str = "android", device_name: Optional[str] = None):
+        if not user_id or not token_val:
+            return
+        now = datetime.utcnow()
+        # 1. Save fcm_token directly on the user document in db.users
+        await db.users.update_many(
+            {"$or": [{"id": user_id}, {"email": user_id}]},
             {"$set": {
-                "user_id": body.user_id,
-                "token": body.device_token,
-                "platform": body.platform,
+                "fcm_token": token_val,
+                "fcm_platform": platform,
+                "fcm_updated_at": now,
+            }}
+        )
+        # 1b. Save fcm_token on the psychic document in db.psychics
+        await db.psychics.update_many(
+            {"$or": [{"id": user_id}, {"email": user_id}]},
+            {"$set": {
+                "fcm_token": token_val,
+                "fcm_platform": platform,
+                "fcm_updated_at": now,
+            }}
+        )
+        # 2. Save in db.device_tokens
+        await db.device_tokens.update_one(
+            {"user_id": user_id, "platform": platform},
+            {"$set": {
+                "user_id": user_id,
+                "token": token_val,
+                "fcm_token": token_val,
+                "platform": platform,
+                "device_name": device_name,
                 "is_active": True,
-                "updated_at": datetime.utcnow()
+                "updated_at": now,
+                "last_seen": now,
+            }, "$setOnInsert": {
+                "id": str(uuid.uuid4()),
+                "created_at": now,
             }},
             upsert=True
         )
-        logger.info(f"📱 Device token registered for user {body.user_id} on {body.platform}")
-        return {"status": "registered"}
+
+    
+    # Push registration endpoint (saves fcm_token in db.users and db.device_tokens)
+    @router.post("/register-push", status_code=201)
+    async def register_push(body: RegisterPushBody):
+        """Register FCM / device token for user in MongoDB"""
+        token_val = body.fcm_token or body.device_token
+        if not token_val:
+            raise HTTPException(status_code=400, detail="fcm_token or device_token is required")
+        await _persist_fcm_token(body.user_id, token_val, body.platform)
+        logger.info(f"📱 FCM token registered for user {body.user_id} on {body.platform}: {token_val[:30]}...")
+        return {"status": "registered", "success": True, "user_id": body.user_id, "fcm_token": token_val}
+
+    @router.post("/fcm-token")
+    async def register_fcm_token_direct(payload: dict):
+        """Save fcm_token directly for user in db.users and db.device_tokens"""
+        user_id = payload.get("user_id")
+        token_val = payload.get("fcm_token") or payload.get("device_token") or payload.get("token")
+        platform = payload.get("platform") or "android"
+        if not user_id or not token_val:
+            raise HTTPException(status_code=400, detail="user_id and fcm_token are required")
+        await _persist_fcm_token(user_id, token_val, platform)
+        logger.info(f"📱 FCM token saved via /fcm-token for user {user_id}: {token_val[:30]}...")
+        return {"success": True, "user_id": user_id, "fcm_token": token_val}
     
     async def send_fcm_notification(token: str, title: str, body: str, data: dict = None, image_url: str = None):
         """Send notification via Firebase (wrapper for backward compatibility)"""
@@ -231,34 +442,11 @@ def create_push_notification_routes(db):
     @router.post("/register-token")
     async def register_device_token(device: DeviceToken):
         """Register a device token for push notifications"""
-        # Check if token already exists
-        existing = await db.device_tokens.find_one({
-            "user_id": device.user_id,
-            "token": device.token
-        })
-        
-        if existing:
-            # Update last seen
-            await db.device_tokens.update_one(
-                {"_id": existing["_id"]},
-                {"$set": {"last_seen": datetime.utcnow()}}
-            )
-            return {"success": True, "message": "Token updated"}
-        
-        # Insert new token
-        token_doc = {
-            "id": str(uuid.uuid4()),
-            "user_id": device.user_id,
-            "token": device.token,
-            "platform": device.platform,
-            "device_name": device.device_name,
-            "created_at": datetime.utcnow(),
-            "last_seen": datetime.utcnow(),
-            "is_active": True
-        }
-        await db.device_tokens.insert_one(token_doc)
-        
-        return {"success": True, "message": "Token registered"}
+        token_val = device.fcm_token or device.token
+        if not token_val:
+            raise HTTPException(status_code=400, detail="token or fcm_token is required")
+        await _persist_fcm_token(device.user_id, token_val, device.platform, device.device_name)
+        return {"success": True, "message": "Token registered", "fcm_token": token_val}
     
     @router.delete("/unregister-token")
     async def unregister_device_token(user_id: str, token: str):
@@ -272,46 +460,14 @@ def create_push_notification_routes(db):
     @router.post("/send")
     async def send_push_notification(notification: PushNotification, background_tasks: BackgroundTasks):
         """Send a push notification to a user"""
-        # Get user's device tokens
-        tokens = await db.device_tokens.find({
-            "user_id": notification.user_id,
-            "is_active": True
-        }).to_list(10)
-        
-        if not tokens:
-            return {"success": False, "message": "No device tokens found for user"}
-        
-        # Log notification
-        notification_log = {
-            "id": str(uuid.uuid4()),
-            "user_id": notification.user_id,
-            "title": notification.title,
-            "body": notification.body,
-            "data": notification.data,
-            "sent_to_devices": len(tokens),
-            "created_at": datetime.utcnow(),
-            "status": "sent"
-        }
-        await db.notification_logs.insert_one(notification_log)
-        
-        # Send to all devices
-        results = []
-        for token_doc in tokens:
-            result = await send_fcm_notification(
-                token_doc["token"],
-                notification.title,
-                notification.body,
-                notification.data,
-                notification.image_url
-            )
-            results.append(result)
-        
-        return {
-            "success": True,
-            "devices_notified": len(tokens),
-            "notification_id": notification_log["id"],
-            "firebase_enabled": FIREBASE_ENABLED
-        }
+        return await send_firebase_push_to_user(
+            db,
+            user_id=notification.user_id,
+            title=notification.title,
+            body=notification.body,
+            data=notification.data,
+            image_url=notification.image_url,
+        )
     
     @router.get("/debug/status")
     async def get_push_debug_status():
@@ -369,41 +525,31 @@ def create_push_notification_routes(db):
             "token_user_ids": [t[:30] + "..." for t in list(token_user_ids)[:5]]
         }
     
+    @router.get("/debug/test-fcm/{fcm_token}")
+    @router.post("/debug/test-fcm/{fcm_token}")
+    async def test_fcm_token_notification(fcm_token: str, title: Optional[str] = None, body: Optional[str] = None):
+        """Send a test push notification directly to an fcm_token"""
+        return await send_firebase_push_to_token(
+            db,
+            fcm_token=fcm_token,
+            title=title or "🎉 Funds Added to Wallet! (Test Push)",
+            body=body or "Test notification sent to fcm_token! Push notifications are working.",
+            data={"type": "wallet_credited", "action_url": "/(tabs)/wallet"},
+        )
+
+    @router.get("/debug/test-push/{user_id}")
     @router.post("/debug/test-push/{user_id}")
     async def test_push_notification(user_id: str):
         """Send a test push notification to a specific user"""
-        # Get user's device tokens
-        tokens = await db.device_tokens.find({
-            "user_id": user_id,
-            "is_active": True
-        }).to_list(10)
-        
-        if not tokens:
-            return {
-                "success": False,
-                "error": "No active device tokens found for this user",
-                "firebase_initialized": FIREBASE_INITIALIZED
-            }
-        
-        results = []
-        for token_doc in tokens:
-            result = await send_firebase_notification(
-                token_doc["token"],
-                "🔔 Test Notification",
-                "This is a test push notification from Sixth Sense Psychics!",
-                {"type": "test", "timestamp": str(datetime.utcnow())}
-            )
-            results.append({
-                "platform": token_doc.get("platform"),
-                "result": result
-            })
-        
-        return {
-            "success": True,
-            "firebase_initialized": FIREBASE_INITIALIZED,
-            "tokens_found": len(tokens),
-            "results": results
-        }
+        user_doc = await db.users.find_one({"id": user_id})
+        fcm_tok = (user_doc or {}).get("fcm_token") or f"fcm_{user_id}_test"
+        return await send_firebase_push_to_token(
+            db,
+            fcm_token=fcm_tok,
+            title="🔔 Sixth Sense Test Notification!",
+            body="This is a test push notification from Sixth Sense Psychics!",
+            data={"type": "wallet_credited", "action_url": "/(tabs)/wallet"},
+        )
     
     @router.post("/debug/test-all-tokens")
     async def test_all_tokens():

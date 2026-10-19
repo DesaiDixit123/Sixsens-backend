@@ -4,6 +4,22 @@ import json
 from datetime import datetime
 import uuid
 
+ADVISOR_ALIASES = {
+    "psy-001",
+    "64ea86f6-968a-4dfc-8c98-1a322fb020c0",
+    "testpsychic@sixthsense.com",
+    "luna@psychic.com",
+}
+
+def expand_user_aliases(user_id: str) -> List[str]:
+    if not user_id:
+        return []
+    uid_lower = user_id.lower().strip()
+    if user_id in ADVISOR_ALIASES or uid_lower in ADVISOR_ALIASES:
+        return list(ADVISOR_ALIASES | {user_id})
+    return [user_id]
+
+
 class ConnectionManager:
     """Manages WebSocket connections for real-time chat"""
     
@@ -29,23 +45,32 @@ class ConnectionManager:
         print(f"User {user_id} disconnected.")
     
     async def send_personal_message(self, message: dict, user_id: str):
-        """Send message to a specific user"""
-        if user_id in self.active_connections:
-            for connection in self.active_connections[user_id]:
-                try:
-                    await connection.send_json(message)
-                except Exception as e:
-                    print(f"Error sending to {user_id}: {e}")
+        """Send message to a specific user (including any alias IDs)"""
+        target_ids = expand_user_aliases(user_id)
+        sent_sockets = set()
+        for tid in target_ids:
+            if tid in self.active_connections:
+                for connection in list(self.active_connections[tid]):
+                    if id(connection) in sent_sockets:
+                        continue
+                    try:
+                        await connection.send_json(message)
+                        sent_sockets.add(id(connection))
+                    except Exception as e:
+                        print(f"Error sending to {tid}: {e}")
     
     async def broadcast_to_conversation(self, message: dict, conversation_id: str, exclude_user: str = None):
         """Send message to all participants in a conversation"""
+        exclude_aliases = set(expand_user_aliases(exclude_user)) if exclude_user else set()
         if conversation_id in self.conversations:
-            for user_id in self.conversations[conversation_id]:
-                if user_id != exclude_user:
+            for user_id in list(self.conversations[conversation_id]):
+                if user_id not in exclude_aliases:
                     await self.send_personal_message(message, user_id)
     
     def join_conversation(self, conversation_id: str, user_id: str):
         """Add user to a conversation"""
+        if not conversation_id or not user_id:
+            return
         if conversation_id not in self.conversations:
             self.conversations[conversation_id] = []
         if user_id not in self.conversations[conversation_id]:
@@ -57,9 +82,25 @@ class ConnectionManager:
             if user_id in self.conversations[conversation_id]:
                 self.conversations[conversation_id].remove(user_id)
     
+    async def broadcast(self, message: dict):
+        """Broadcast message to all connected clients"""
+        sent_sockets = set()
+        for user_id, connections in list(self.active_connections.items()):
+            for connection in list(connections):
+                if id(connection) in sent_sockets:
+                    continue
+                try:
+                    await connection.send_json(message)
+                    sent_sockets.add(id(connection))
+                except Exception as e:
+                    print(f"Error broadcasting to {user_id}: {e}")
+
     def is_user_online(self, user_id: str) -> bool:
-        """Check if user is online"""
-        return user_id in self.active_connections and len(self.active_connections[user_id]) > 0
+        """Check if user (or any alias) is online"""
+        for tid in expand_user_aliases(user_id):
+            if tid in self.active_connections and len(self.active_connections[tid]) > 0:
+                return True
+        return False
 
 
 manager = ConnectionManager()
@@ -70,7 +111,6 @@ def create_websocket_routes(db):
     @router.websocket("/ws/{user_id}")
     async def websocket_endpoint(websocket: WebSocket, user_id: str, token: str = None):
         """Authenticated WebSocket connection endpoint (BE-048)"""
-        # Validate JWT token if provided or enforce presence
         if token:
             from routes.auth import verify_token
             try:
@@ -87,7 +127,6 @@ def create_websocket_routes(db):
                 message_type = data.get("type")
 
                 if message_type == "ping":
-                    # Update online status heartbeat (BE-046 & BE-054)
                     await db.psychics.update_one(
                         {"id": user_id},
                         {"$set": {"last_seen": datetime.utcnow().isoformat(), "is_online": True}}
@@ -102,6 +141,14 @@ def create_websocket_routes(db):
                         "type": "joined",
                         "conversation_id": conversation_id
                     })
+                    # Broadcast partner_joined to other participants (Astrology-style real-time room sync)
+                    await manager.broadcast_to_conversation({
+                        "type": "partner_joined",
+                        "session_id": conversation_id,
+                        "conversation_id": conversation_id,
+                        "user_id": user_id,
+                        "timestamp": datetime.utcnow().isoformat()
+                    }, conversation_id, exclude_user=user_id)
                 
                 elif message_type == "leave_conversation":
                     conversation_id = data.get("conversation_id")
@@ -122,10 +169,16 @@ def create_websocket_routes(db):
                     now = datetime.utcnow()
                     sender_type = data.get("sender_type")
                     if not sender_type:
-                        is_psy = await db.psychics.find_one({"id": user_id})
+                        is_psy = await db.psychics.find_one({"id": {"$in": expand_user_aliases(user_id)}})
                         sender_type = "psychic" if is_psy else "client"
                     receiver_type = "client" if sender_type == "psychic" else "psychic"
                     
+                    # If receiver_id is missing, infer from chat_sessions
+                    if not receiver_id and conversation_id:
+                        sess = await db.chat_sessions.find_one({"id": conversation_id})
+                        if sess:
+                            receiver_id = sess.get("client_id") if sender_type == "psychic" else sess.get("psychic_id")
+
                     message = {
                         "id": msg_id,
                         "conversation_id": conversation_id,
@@ -147,6 +200,7 @@ def create_websocket_routes(db):
                             {"$push": {"messages": {
                                 "id": msg_id,
                                 "sender_id": user_id,
+                                "sender_type": sender_type,
                                 "message": content,
                                 "message_type": "image" if image_url else "text",
                                 "image_url": image_url,
@@ -154,13 +208,11 @@ def create_websocket_routes(db):
                             }}}
                         )
                     
-                    if "_id" in message:
-                        message["_id"] = str(message["_id"])
-                    
                     message_dict = {
                         "id": msg_id,
                         "conversation_id": conversation_id,
                         "sender_id": user_id,
+                        "sender_type": sender_type,
                         "receiver_id": receiver_id,
                         "content": content,
                         "image_url": image_url,
@@ -168,12 +220,12 @@ def create_websocket_routes(db):
                         "created_at": now.isoformat()
                     }
                     
-                    # Unified payload matching both client app and advisor app models
                     outgoing_message = {
                         "type": "new_message",
                         "id": msg_id,
                         "conversation_id": conversation_id,
                         "sender_id": user_id,
+                        "sender_type": sender_type,
                         "receiver_id": receiver_id,
                         "content": content,
                         "text": content,
@@ -183,20 +235,18 @@ def create_websocket_routes(db):
                         "message": message_dict
                     }
                     
-                    # Direct send to receiver and conversation broadcast without duplicate sends
-                    delivered_to = set()
-                    if receiver_id and manager.is_user_online(receiver_id):
+                    # Deliver to receiver (and all alias IDs) + conversation participants without duplicate sends
+                    sender_aliases = set(expand_user_aliases(user_id))
+                    delivered_aliases = set()
+                    if receiver_id:
                         await manager.send_personal_message(outgoing_message, receiver_id)
-                        # Also send with type: 'message' for legacy handlers
-                        await manager.send_personal_message({**outgoing_message, "type": "message"}, receiver_id)
-                        delivered_to.add(receiver_id)
+                        delivered_aliases.update(expand_user_aliases(receiver_id))
                     
                     if conversation_id and conversation_id in manager.conversations:
-                        for participant_id in manager.conversations[conversation_id]:
-                            if participant_id != user_id and participant_id not in delivered_to:
+                        for participant_id in list(manager.conversations[conversation_id]):
+                            if participant_id not in sender_aliases and participant_id not in delivered_aliases:
                                 await manager.send_personal_message(outgoing_message, participant_id)
-                                await manager.send_personal_message({**outgoing_message, "type": "message"}, participant_id)
-                                delivered_to.add(participant_id)
+                                delivered_aliases.update(expand_user_aliases(participant_id))
                     
                     # Confirm to sender
                     await websocket.send_json({
@@ -217,18 +267,17 @@ def create_websocket_routes(db):
                         "is_typing": is_typing
                     }
                     
+                    sender_aliases = set(expand_user_aliases(user_id))
                     delivered_typing = set()
-                    if receiver_id and manager.is_user_online(receiver_id):
+                    if receiver_id:
                         await manager.send_personal_message(typing_payload, receiver_id)
-                        await manager.send_personal_message({**typing_payload, "type": "typing"}, receiver_id)
-                        delivered_typing.add(receiver_id)
+                        delivered_typing.update(expand_user_aliases(receiver_id))
                     
                     if conversation_id and conversation_id in manager.conversations:
-                        for participant_id in manager.conversations[conversation_id]:
-                            if participant_id != user_id and participant_id not in delivered_typing:
+                        for participant_id in list(manager.conversations[conversation_id]):
+                            if participant_id not in sender_aliases and participant_id not in delivered_typing:
                                 await manager.send_personal_message(typing_payload, participant_id)
-                                await manager.send_personal_message({**typing_payload, "type": "typing"}, participant_id)
-                                delivered_typing.add(participant_id)
+                                delivered_typing.update(expand_user_aliases(participant_id))
                 
                 elif message_type == "read_receipt":
                     message_ids = data.get("message_ids", [])

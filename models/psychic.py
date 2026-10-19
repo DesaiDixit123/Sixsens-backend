@@ -17,6 +17,9 @@ class Psychic(BaseModel):
     topics: List[str] = []  # Love, Career, etc.
     languages: List[str] = ["English"]
     chat_rate: float = 2.99  # Per minute rate ($1.99 - $6.99)
+    phone_rate: float = 4.99
+    video_rate: float = 6.99
+    video_call_rate: float = 6.99
     status: str = "approved"  # pending, approved, rejected, suspended, banned
     online_status: str = "offline"  # online, busy, offline
     average_rating: float = 0.0
@@ -25,7 +28,9 @@ class Psychic(BaseModel):
     is_featured: bool = False
     advisor_number: int = 0  # Order in which advisor joined (1-30 = founding advisors)
     offers_chat: bool = True
+    offers_phone: bool = True
     offers_video: bool = True
+    offers_video_call: bool = True
     offers_recorded_readings: bool = True  # Toggle for standard/emergency video questions
     balance: float = 0.0
     total_earnings: float = 0.0
@@ -54,8 +59,9 @@ class PsychicListResponse(BaseModel):
     topics: List[str]
     reading_methods: List[str]
     chat_rate: float
-    phone_rate: float = 0.0
-    video_call_rate: float = 0.0
+    phone_rate: float = 4.99
+    video_rate: float = 6.99
+    video_call_rate: float = 6.99
     online_status: str
     average_rating: float
     total_reviews: int
@@ -63,12 +69,14 @@ class PsychicListResponse(BaseModel):
     is_featured: bool
     is_new: bool
     advisor_number: int = 0
-    offers_chat: bool
+    offers_chat: bool = True
     offers_phone: bool = True
-    offers_video: bool
+    offers_video: bool = True
     offers_video_call: bool = True
     offers_recorded_readings: bool = True
+
     can_receive_recorded_questions: bool = False
     intro_video_url: Optional[str] = None
     intro_video_duration: Optional[int] = None
     interview_answers: Optional[List[dict]] = None
+

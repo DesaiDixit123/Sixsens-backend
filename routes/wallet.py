@@ -42,6 +42,7 @@ class Transaction(BaseModel):
 
 class WalletResponse(BaseModel):
     balance: float
+    free_credits: float = 0.0
     total_available: float
     is_new_user: bool = True
     first_reading_free_used: bool = False
@@ -70,9 +71,37 @@ def _serialize_tx(t: dict) -> dict:
 def create_wallet_routes(db: AsyncIOMotorDatabase):
 
     async def _get_user_or_404(user_id: str) -> dict:
-        user = await _db(db.users.find_one({"id": user_id}))
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
+        if not user_id:
+            raise HTTPException(status_code=400, detail="user_id is required")
+        from pymongo import ReturnDocument
+        default_fcm = f"fcm_{user_id}_{uuid.uuid4().hex[:16]}"
+        user = await _db(db.users.find_one_and_update(
+            {"id": user_id},
+            {
+                "$setOnInsert": {
+                    "id": user_id,
+                    "email": f"{user_id}@sixthsense.com",
+                    "name": "Client User",
+                    "balance": 0.0,
+                    "free_credits": 0.0,
+                    "is_new_user": False,
+                    "first_reading_free_used": True,
+                    "free_minutes_available": 0,
+                    "saved_payment_methods": [],
+                    "fcm_token": default_fcm,
+                    "fcm_platform": "android",
+                    "created_at": datetime.utcnow(),
+                }
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        ))
+        if user and not user.get("fcm_token"):
+            await _db(db.users.update_one(
+                {"id": user_id},
+                {"$set": {"fcm_token": default_fcm, "fcm_platform": "android", "fcm_updated_at": datetime.utcnow()}}
+            ))
+            user["fcm_token"] = default_fcm
         return user
 
     # ---- Transactions (declared before "/{user_id}" so "/transactions" isn't captured by it) ----
@@ -184,6 +213,37 @@ def create_wallet_routes(db: AsyncIOMotorDatabase):
         }
         await _db(db.transactions.insert_one(transaction))
 
+        async def _bg_wallet_notify():
+            try:
+                notif_body = f"+${request.amount:.2f} added! Your wallet balance is now ${new_balance:.2f}."
+                await db.notifications.insert_one({
+                    "id": str(uuid.uuid4()),
+                    "user_id": user["id"],
+                    "type": "wallet_credited",
+                    "title": "🎉 Funds Added to Wallet!",
+                    "body": notif_body,
+                    "message": notif_body,
+                    "data": {"credits": str(int(request.amount)), "balance": str(new_balance), "type": "wallet_topup"},
+                    "is_read": False,
+                    "created_at": datetime.utcnow()
+                })
+                from routes.push_notifications import send_firebase_push_to_user
+                await send_firebase_push_to_user(
+                    db,
+                    user_id=user["id"],
+                    title="🎉 Funds Added to Wallet!",
+                    body=notif_body,
+                    data={
+                        "type": "wallet_credited",
+                        "credits": str(int(request.amount)),
+                        "balance": str(new_balance),
+                        "action_url": "/(tabs)/wallet",
+                    },
+                )
+            except Exception:
+                pass
+        asyncio.create_task(_bg_wallet_notify())
+
         return {
             "success": True,
             "new_balance": new_balance,
@@ -203,12 +263,16 @@ def create_wallet_routes(db: AsyncIOMotorDatabase):
     async def get_wallet_by_user_id(user_id: str):
         user = await _get_user_or_404(user_id)
         balance = float(user.get("balance", 0.0) or 0.0)
+        free_credits = float(user.get("free_credits", 0.0) or 0.0)
+        free_minutes_available = int(user.get("free_minutes_available", 0) or 0)
+        has_free_offer = (free_credits > 0 or free_minutes_available > 0) and not user.get("first_reading_free_used", False)
         return WalletResponse(
             balance=balance,
+            free_credits=free_credits,
             total_available=balance,
-            is_new_user=user.get("is_new_user", True),
-            first_reading_free_used=user.get("first_reading_free_used", False),
-            free_minutes_available=user.get("free_minutes_available", 0),
+            is_new_user=bool(user.get("is_new_user", False) and has_free_offer),
+            first_reading_free_used=bool(user.get("first_reading_free_used", False) or not has_free_offer),
+            free_minutes_available=free_minutes_available,
             payment_methods=[PaymentMethod(**pm) for pm in user.get("saved_payment_methods", [])
                              if pm.get("id") and pm.get("type") and pm.get("last_four")]
         )

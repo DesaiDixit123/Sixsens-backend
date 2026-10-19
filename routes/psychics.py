@@ -29,6 +29,7 @@ MOCK_PSYCHICS = [
         "languages": ["English", "Spanish"],
         "chat_rate": 3.99,
         "phone_rate": 5.99,
+        "video_rate": 7.99,
         "video_call_rate": 7.99,
         "online_status": "online",
         "average_rating": 4.9,
@@ -44,6 +45,7 @@ MOCK_PSYCHICS = [
         "offers_video": True,
         "offers_video_call": True,
         "offers_recorded_readings": True,
+
         "offers_standard_readings": True,
         "offers_emergency_readings": True,
         "can_receive_recorded_questions": True,
@@ -724,22 +726,59 @@ def create_psychic_routes(db: AsyncIOMotorDatabase):
         # Start with mock data - ONLY show approved psychics to regular users (excluding deleted)
         psychics = [p for p in get_active_psychics() if p.get("status") == "approved"]
         
-        # Also fetch real psychics from database (approved applications)
+        # Also fetch real psychics from database (approved applications) and sync statuses
         try:
             db_psychics = await db.psychics.find({}).to_list(100)
             for dbp in db_psychics:
-                # Convert DB psychic to API format
-                # Get service availability - these are toggled by the psychic in their Advisor app
                 is_online = dbp.get("online_status", "offline") == "online"
-                offers_chat = dbp.get("offers_chat", True)
-                offers_phone = dbp.get("offers_phone", True)
-                offers_video = dbp.get("offers_video", False)
+                online_status_val = dbp.get("online_status", "offline")
+                offers_chat = is_online and bool(dbp.get("offers_chat", True))
+                offers_phone = is_online and bool(dbp.get("offers_phone", True))
+                offers_video = is_online and bool(dbp.get("offers_video", dbp.get("offers_video_call", True)))
                 offers_recorded = dbp.get("offers_recorded_readings", True)
                 offers_standard = dbp.get("offers_standard_readings", True)
                 offers_emergency = dbp.get("offers_emergency_readings", False)
                 
+                db_id = dbp.get("id", str(dbp.get("_id", "")))
+                db_email = (dbp.get("email") or "").lower().strip()
+                db_name = (dbp.get("name") or "").lower().strip()
+
+                # Check if this DB psychic matches any mock psychic (by id, email, or name)
+                matched_mock = False
+                for mp in psychics:
+                    mp_id = mp.get("id", "")
+                    mp_email = (mp.get("email") or "").lower().strip()
+                    mp_name = (mp.get("name") or "").lower().strip()
+                    if (
+                        mp_id == db_id
+                        or (db_email and mp_email == db_email)
+                        or (db_name and mp_name == db_name)
+                        or (db_email in ("testpsychic@sixthsense.com", "luna@psychic.com") and mp_id == "psy-001")
+                    ):
+                        mp["online_status"] = online_status_val
+                        mp["is_online"] = is_online
+                        mp["offers_chat"] = offers_chat
+                        mp["offers_phone"] = offers_phone
+                        mp["offers_video"] = offers_video
+                        mp["offers_video_call"] = offers_video
+                        mp["offers_standard_readings"] = offers_standard
+                        mp["offers_emergency_readings"] = offers_emergency
+                        if dbp.get("chat_rate"):
+                            mp["chat_rate"] = dbp["chat_rate"]
+                        if dbp.get("phone_rate"):
+                            mp["phone_rate"] = dbp["phone_rate"]
+                        if dbp.get("video_rate") or dbp.get("video_call_rate"):
+                            v_rate = dbp.get("video_rate") or dbp.get("video_call_rate")
+                            mp["video_rate"] = v_rate
+                            mp["video_call_rate"] = v_rate
+                        matched_mock = True
+
+                if matched_mock:
+                    continue
+
+                v_rate = dbp.get("video_rate") or dbp.get("video_call_rate") or 5.99
                 real_psychic = {
-                    "id": dbp.get("id", str(dbp.get("_id", ""))),
+                    "id": db_id,
                     "name": dbp.get("name", ""),
                     "email": dbp.get("email", ""),
                     "profile_picture": dbp.get("profile_picture", "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400"),
@@ -751,13 +790,14 @@ def create_psychic_routes(db: AsyncIOMotorDatabase):
                     "years_experience": dbp.get("years_experience", "1-3 years"),
                     "price_per_minute": dbp.get("chat_rate", 2.99),
                     "chat_rate": dbp.get("chat_rate", 2.99),
-                    "phone_rate": dbp.get("phone_rate", 3.99),
-                    "video_rate": dbp.get("video_rate", 4.99),
+                    "phone_rate": dbp.get("phone_rate", 4.99),
+                    "video_rate": v_rate,
+                    "video_call_rate": v_rate,
                     "average_rating": dbp.get("average_rating", 5.0),
                     "total_reviews": dbp.get("total_readings", 0),
                     "total_readings": dbp.get("total_readings", 0),  # Required field
                     "is_online": is_online,
-                    "online_status": dbp.get("online_status", "offline"),
+                    "online_status": online_status_val,
                     "is_verified": dbp.get("is_verified", True),
                     "is_featured": False,
                     "is_new": True,
@@ -845,16 +885,12 @@ def create_psychic_routes(db: AsyncIOMotorDatabase):
         if psychic_id in DELETED_PSYCHIC_IDS:
             raise HTTPException(status_code=404, detail="Psychic not found")
         
-        # First check mock psychics
-        for p in MOCK_PSYCHICS:
-            if p["id"] == psychic_id:
-                # Auto-update tags based on ratings
-                update_psychic_tags(p)
-                return PsychicListResponse(**p)
-        
-        # Then check database for real psychics (BE-018: Safe ObjectId lookup)
+        # Check database for real psychics first so live status is always respected
+        db_psychic = None
         try:
             db_psychic = await db.psychics.find_one({"id": psychic_id})
+            if not db_psychic and psychic_id == "psy-001":
+                db_psychic = await db.psychics.find_one({"email": {"$in": ["testpsychic@sixthsense.com", "luna@psychic.com"]}})
             if not db_psychic:
                 try:
                     from bson.objectid import ObjectId
@@ -866,16 +902,44 @@ def create_psychic_routes(db: AsyncIOMotorDatabase):
                 db_psychic = await db.psychics.find_one({"_id": psychic_id})
             if not db_psychic:
                 db_psychic = await db.psychics.find_one({"email": "advisor@psychic.com"}) if "luna" in psychic_id.lower() or "test" in psychic_id.lower() else None
-            
-            if db_psychic:
+        except Exception as e:
+            print(f"Error looking up psychic in DB: {e}")
+
+        # Check mock psychics and merge live DB status if found
+        for p in MOCK_PSYCHICS:
+            if p["id"] == psychic_id or (psychic_id == "64ea86f6-968a-4dfc-8c98-1a322fb020c0" and p["id"] == "psy-001"):
+                if db_psychic:
+                    is_online = db_psychic.get("online_status", "offline") == "online"
+                    p["online_status"] = db_psychic.get("online_status", p.get("online_status", "online"))
+                    p["is_online"] = is_online
+                    p["offers_chat"] = is_online and bool(db_psychic.get("offers_chat", True))
+                    p["offers_phone"] = is_online and bool(db_psychic.get("offers_phone", True))
+                    p["offers_video"] = is_online and bool(db_psychic.get("offers_video", db_psychic.get("offers_video_call", True)))
+                    p["offers_video_call"] = p["offers_video"]
+                else:
+                    is_online = p.get("online_status", "online") == "online"
+                    p["offers_chat"] = is_online and bool(p.get("offers_chat", True))
+                    p["offers_phone"] = is_online and bool(p.get("offers_phone", True))
+                    p["offers_video"] = is_online and bool(p.get("offers_video", p.get("offers_video_call", True)))
+                    p["offers_video_call"] = p["offers_video"]
+                update_psychic_tags(p)
+                resp_dict = dict(p)
+                resp_dict["id"] = psychic_id
+                resp_dict["video_rate"] = resp_dict.get("video_rate") or resp_dict.get("video_call_rate") or 7.99
+                resp_dict["video_call_rate"] = resp_dict["video_rate"]
+                return PsychicListResponse(**resp_dict)
+        
+        if db_psychic:
+            try:
                 # Get actual service availability from database
                 is_online = db_psychic.get("online_status", "offline") == "online"
-                offers_chat = db_psychic.get("offers_chat", True)
-                offers_phone = db_psychic.get("offers_phone", True)
-                offers_video = db_psychic.get("offers_video", False)
+                offers_chat = is_online and bool(db_psychic.get("offers_chat", True))
+                offers_phone = is_online and bool(db_psychic.get("offers_phone", True))
+                offers_video = is_online and bool(db_psychic.get("offers_video", db_psychic.get("offers_video_call", True)))
                 offers_recorded = db_psychic.get("offers_recorded_readings", True)
                 offers_standard = db_psychic.get("offers_standard_readings", True)
                 offers_emergency = db_psychic.get("offers_emergency_readings", False)
+                v_rate = db_psychic.get("video_rate") or db_psychic.get("video_call_rate") or 5.99
                 
                 real_psychic = {
                     "id": db_psychic.get("id", str(db_psychic.get("_id", ""))),
@@ -890,8 +954,9 @@ def create_psychic_routes(db: AsyncIOMotorDatabase):
                     "years_experience": db_psychic.get("years_experience", "5-10 years"),
                     "price_per_minute": db_psychic.get("chat_rate", 2.99),
                     "chat_rate": db_psychic.get("chat_rate", 2.99),
-                    "phone_rate": db_psychic.get("phone_rate", 3.99),
-                    "video_call_rate": db_psychic.get("video_rate", 4.99),
+                    "phone_rate": db_psychic.get("phone_rate", 4.99),
+                    "video_rate": v_rate,
+                    "video_call_rate": v_rate,
                     "average_rating": db_psychic.get("average_rating", 4.9),
                     "total_reviews": db_psychic.get("total_readings", 0),
                     "total_readings": db_psychic.get("total_readings", 0),
@@ -914,8 +979,9 @@ def create_psychic_routes(db: AsyncIOMotorDatabase):
                     "interview_answers": db_psychic.get("interview_answers", []),
                 }
                 return PsychicListResponse(**real_psychic)
-        except Exception as e:
-            print(f"Error fetching psychic from DB: {e}")
+            except Exception as e:
+                print(f"Error formatting psychic from DB: {e}")
+
         
         raise HTTPException(status_code=404, detail="Psychic not found")
     
@@ -929,6 +995,22 @@ def create_psychic_routes(db: AsyncIOMotorDatabase):
             {"id": psychic_id},
             {"$set": {"online_status": new_status, "is_online": is_online, "last_seen": datetime.utcnow().isoformat()}}
         )
+        for mp in MOCK_PSYCHICS:
+            if mp.get("id") == psychic_id or (psychic_id == "64ea86f6-968a-4dfc-8c98-1a322fb020c0" and mp.get("id") == "psy-001"):
+                mp["online_status"] = new_status
+                mp["is_online"] = is_online
+
+        try:
+            from routes.websocket import manager
+            await manager.broadcast({
+                "type": "psychic_status_changed",
+                "psychic_id": psychic_id,
+                "online_status": new_status,
+                "is_online": is_online,
+                "offers_chat": is_online,
+            })
+        except Exception as e:
+            print(f"Error broadcasting psychic status: {e}")
 
         if is_online:
             # Trigger push notification to users who favorited this advisor (BE-073)
@@ -954,6 +1036,7 @@ def create_psychic_routes(db: AsyncIOMotorDatabase):
                 print(f"Error triggering favorite advisor online pushes: {e}")
 
         return {"success": True, "online_status": new_status}
+
 
     @router.delete("/{psychic_id}")
     async def delete_psychic(psychic_id: str):
@@ -1160,7 +1243,9 @@ def create_user_routes(db: AsyncIOMotorDatabase):
             {"id": user_id},
             {"$set": {
                 "first_reading_free_used": True,
-                "is_new_user": False
+                "is_new_user": False,
+                "free_credits": 0.0,
+                "free_minutes_available": 0,
             }}
         )
         return {"success": True, "message": "First reading marked as used"}

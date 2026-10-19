@@ -203,40 +203,61 @@ def create_psychic_portal_routes(db):
     
     @router.post("/update-status")
     async def update_online_status(status_data: dict):
-        """Update psychic online status - syncs between Advisor and Client apps"""
+        """Update psychic online status - syncs between Advisor and Client apps in real-time"""
         psychic_id = status_data.get("psychic_id")
         email = status_data.get("email")
         online_status = status_data.get("online_status")
         offers_chat = status_data.get("offers_chat")
         offers_phone = status_data.get("offers_phone")
         offers_video = status_data.get("offers_video")
+        if offers_video is None and "offers_video_call" in status_data:
+            offers_video = status_data.get("offers_video_call")
         offers_standard_readings = status_data.get("offers_standard_readings")
         offers_emergency_readings = status_data.get("offers_emergency_readings")
-        
-        # Build update data - only include fields that were provided
-        update_data = {"updated_at": datetime.utcnow()}
-        
-        if online_status is not None:
-            update_data["online_status"] = online_status
-            update_data["is_available"] = online_status == "online"
-        if offers_chat is not None:
-            update_data["offers_chat"] = offers_chat
-        if offers_phone is not None:
-            update_data["offers_phone"] = offers_phone
-        if offers_video is not None:
-            update_data["offers_video"] = offers_video
-        if offers_standard_readings is not None:
-            update_data["offers_standard_readings"] = offers_standard_readings
-        if offers_emergency_readings is not None:
-            update_data["offers_emergency_readings"] = offers_emergency_readings
-        
+
         # Find psychic by ID or email
         psychic = None
         if psychic_id:
             psychic = await db.psychics.find_one({"id": psychic_id})
         if not psychic and email:
             psychic = await db.psychics.find_one({"email": email})
-        
+
+        # Determine effective service toggles
+        if offers_chat is None and offers_phone is None and offers_video is None and online_status is not None:
+            is_on = online_status == "online"
+            offers_chat = is_on
+            offers_phone = is_on
+            offers_video = is_on
+        else:
+            if offers_chat is None:
+                offers_chat = bool(psychic.get("offers_chat", True)) if psychic else True
+            if offers_phone is None:
+                offers_phone = bool(psychic.get("offers_phone", True)) if psychic else True
+            if offers_video is None:
+                offers_video = bool(psychic.get("offers_video", psychic.get("offers_video_call", True))) if psychic else True
+            any_live = bool(offers_chat or offers_phone or offers_video)
+            online_status = "online" if any_live else "offline"
+
+        # Build update data
+        update_data = {
+            "updated_at": datetime.utcnow(),
+            "online_status": online_status,
+            "is_available": online_status == "online",
+            "is_online": online_status == "online",
+            "offers_chat": bool(offers_chat),
+            "offers_phone": bool(offers_phone),
+            "offers_video": bool(offers_video),
+            "offers_video_call": bool(offers_video),
+        }
+        if offers_standard_readings is not None:
+            update_data["offers_standard_readings"] = offers_standard_readings
+        if offers_emergency_readings is not None:
+            update_data["offers_emergency_readings"] = offers_emergency_readings
+
+        actual_id = psychic.get("id") if psychic else psychic_id
+        actual_email = psychic.get("email") if psychic else email
+        actual_name = psychic.get("name") if psychic else None
+
         if not psychic:
             # Create/update psychic entry if it doesn't exist
             filter_query = {"email": email} if email else {"id": psychic_id}
@@ -251,12 +272,68 @@ def create_psychic_portal_routes(db):
                 {"_id": psychic["_id"]},
                 {"$set": update_data}
             )
+
+        # Also sync in-memory MOCK_PSYCHICS so endpoints like /psychic-of-the-week & /psychics reflect immediately
+        alias_ids = [x for x in [actual_id, psychic_id] if x]
+        try:
+            from routes.psychics import MOCK_PSYCHICS
+            email_l = (actual_email or "").lower().strip()
+            name_l = (actual_name or "").lower().strip()
+            for mp in MOCK_PSYCHICS:
+                mp_id = mp.get("id", "")
+                mp_email = (mp.get("email") or "").lower().strip()
+                mp_name = (mp.get("name") or "").lower().strip()
+                if (
+                    mp_id in alias_ids
+                    or (email_l and mp_email == email_l)
+                    or (name_l and mp_name == name_l)
+                    or (email_l in ("testpsychic@sixthsense.com", "luna@psychic.com") and mp_id == "psy-001")
+                ):
+                    mp["online_status"] = online_status
+                    mp["is_online"] = online_status == "online"
+                    mp["offers_chat"] = bool(offers_chat)
+                    mp["offers_phone"] = bool(offers_phone)
+                    mp["offers_video"] = bool(offers_video)
+                    mp["offers_video_call"] = bool(offers_video)
+                    if mp_id not in alias_ids:
+                        alias_ids.append(mp_id)
+                    if not actual_name:
+                        actual_name = mp.get("name")
+        except Exception as e:
+            print(f"Error syncing MOCK_PSYCHICS: {e}")
+
+        # Broadcast real-time status update over WebSocket to all connected clients
+        try:
+            from routes.websocket import manager
+            ws_payload = {
+                "type": "psychic_status_changed",
+                "psychic_id": actual_id or psychic_id,
+                "alias_ids": alias_ids,
+                "email": actual_email or email,
+                "name": actual_name,
+                "online_status": online_status,
+                "is_online": online_status == "online",
+                "offers_chat": bool(offers_chat),
+                "offers_phone": bool(offers_phone),
+                "offers_video": bool(offers_video),
+                "offers_video_call": bool(offers_video),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            await manager.broadcast(ws_payload)
+            print(f"📡 WebSocket Broadcast: psychic_status_changed -> {actual_name or actual_id} ({alias_ids}) is now {online_status} (chat={offers_chat}, phone={offers_phone}, video={offers_video})")
+        except Exception as e:
+            print(f"Error broadcasting status over WebSocket: {e}")
         
         return {
             "success": True,
             "online_status": online_status,
+            "offers_chat": bool(offers_chat),
+            "offers_phone": bool(offers_phone),
+            "offers_video": bool(offers_video),
+            "offers_video_call": bool(offers_video),
             "message": "Status updated successfully"
         }
+
     
     # ============ WITHDRAWALS ============
     @router.post("/withdraw")
