@@ -51,12 +51,49 @@ class PayoutRequest(BaseModel):
 def create_payment_routes(db):
     router = APIRouter(prefix="/payments", tags=["payments"])
     
+    async def get_active_stripe_config():
+        """Dynamically fetch current Stripe configuration from MongoDB or fall back to .env"""
+        try:
+            doc = await db.platform_settings.find_one({"key": "stripe_config"})
+            if doc:
+                secret = (doc.get("secret_key") or os.getenv("STRIPE_SECRET_KEY", "")).strip()
+                pub = (doc.get("publishable_key") or os.getenv("STRIPE_PUBLISHABLE_KEY", "")).strip()
+                wh = (doc.get("webhook_secret") or os.getenv("STRIPE_WEBHOOK_SECRET", "")).strip()
+                enabled = doc.get("is_enabled", bool(secret))
+                mode = doc.get("mode", "live" if secret.startswith("sk_live") else "test")
+                currency = (doc.get("currency") or "usd").strip().lower()
+                return {
+                    "publishable_key": pub,
+                    "secret_key": secret,
+                    "webhook_secret": wh,
+                    "stripe_enabled": enabled and bool(secret),
+                    "mode": mode,
+                    "currency": currency
+                }
+        except Exception:
+            pass
+
+        secret = (os.getenv("STRIPE_SECRET_KEY") or "").strip()
+        pub = (os.getenv("STRIPE_PUBLISHABLE_KEY") or "").strip()
+        wh = (os.getenv("STRIPE_WEBHOOK_SECRET") or "").strip()
+        return {
+            "publishable_key": pub or "pk_test_placeholder",
+            "secret_key": secret,
+            "webhook_secret": wh,
+            "stripe_enabled": bool(secret),
+            "mode": "live" if secret.startswith("sk_live") else "test",
+            "currency": "usd"
+        }
+
     @router.get("/config")
     async def get_payment_config():
-        """Get Stripe publishable key for frontend"""
+        """Get dynamic Stripe publishable key and mode for frontend"""
+        cfg = await get_active_stripe_config()
         return {
-            "publishable_key": STRIPE_PUBLISHABLE_KEY or "pk_test_placeholder",
-            "stripe_enabled": STRIPE_ENABLED
+            "publishable_key": cfg["publishable_key"],
+            "stripe_enabled": cfg["stripe_enabled"],
+            "mode": cfg["mode"],
+            "currency": cfg["currency"]
         }
     
     @router.post("/create-payment-intent")
@@ -79,11 +116,13 @@ def create_payment_routes(db):
         amount_cents = int(request.amount * 100)
         idempotency_key = f"pi_{request.user_id}_{amount_cents}_{int(datetime.utcnow().timestamp()//60)}"
         
-        if STRIPE_ENABLED:
+        cfg = await get_active_stripe_config()
+        if cfg["stripe_enabled"] and cfg["secret_key"]:
             try:
+                stripe.api_key = cfg["secret_key"]
                 intent = stripe.PaymentIntent.create(
                     amount=amount_cents,
-                    currency="usd",
+                    currency=cfg.get("currency", "usd"),
                     metadata={
                         "user_id": request.user_id,
                         "package_credits": request.package_credits or 0,
@@ -106,7 +145,7 @@ def create_payment_routes(db):
                 "client_secret": f"{mock_intent_id}_secret_mock",
                 "payment_intent_id": mock_intent_id,
                 "mock": True,
-                "message": "Stripe not configured. Using mock payment."
+                "message": "Stripe not configured or disabled in Admin settings. Using mock payment."
             }
     
     async def _db(coro, timeout: float = 8.0):

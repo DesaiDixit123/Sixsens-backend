@@ -46,6 +46,25 @@ def create_psychic_portal_routes(db):
         app_data["password_hash"] = password_hash
         
         await db.psychic_applications.insert_one(app_data)
+        
+        # Notify admin of new application
+        try:
+            from routes.push_notifications import send_push_to_user
+            await send_push_to_user(
+                db,
+                user_id="admin",
+                title="New Advisor Application! 📝",
+                body=f"{new_app.full_name} has submitted an application.",
+                data={
+                    "type": "new_application",
+                    "application_id": str(new_app.id),
+                    "applicant_name": str(new_app.full_name),
+                    "email": str(new_app.email)
+                }
+            )
+        except Exception as e:
+            print(f"Error sending push notification to admin: {e}")
+
         return {"success": True, "application_id": new_app.id}
     
     @router.get("/application/{application_id}")

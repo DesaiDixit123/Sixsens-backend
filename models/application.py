@@ -34,6 +34,8 @@ class PsychicApplication(BaseModel):
     intro_video_url: Optional[str] = None
     intro_video_duration: Optional[int] = None
     interview_answers: Optional[List[dict]] = None
+    device_token: Optional[str] = None
+    fcm_token: Optional[str] = None
     # Status
     status: str = "pending"  # pending, under_review, accepted, rejected
     rejection_reason: Optional[str] = None
@@ -67,6 +69,8 @@ class ApplicationCreate(BaseModel):
     intro_video_url: Optional[str] = None
     intro_video_duration: Optional[int] = None
     interview_answers: Optional[List[dict]] = None
+    device_token: Optional[str] = None
+    fcm_token: Optional[str] = None
 
 class ApplicationResponse(BaseModel):
     id: str
@@ -91,6 +95,8 @@ class ApplicationResponse(BaseModel):
     intro_video_url: Optional[str] = None
     intro_video_duration: Optional[int] = None
     interview_answers: Optional[List[dict]] = None
+    device_token: Optional[str] = None
+    fcm_token: Optional[str] = None
     status: str
     rejection_reason: Optional[str] = None
     reviewed_at: Optional[datetime] = None

@@ -7,12 +7,25 @@ import os
 def create_stripe_connect_router(db: AsyncIOMotorDatabase):
     router = APIRouter(prefix="/stripe-connect", tags=["stripe-connect"])
     
-    # Initialize Stripe
+    async def ensure_stripe_key():
+        """Dynamically load active Stripe secret key from MongoDB or fallback to .env"""
+        try:
+            doc = await db.platform_settings.find_one({"key": "stripe_config"})
+            if doc and doc.get("secret_key"):
+                stripe.api_key = doc["secret_key"].strip()
+                return stripe.api_key
+        except Exception:
+            pass
+        stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+        return stripe.api_key
+    
+    # Initialize Stripe default
     stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
     
     @router.get("/account-status/{psychic_id}")
     async def get_account_status(psychic_id: str):
         """Get Stripe Connect account status for a psychic"""
+        await ensure_stripe_key()
         try:
             # Get psychic from database
             psychic = await db.psychics.find_one({"$or": [{"id": psychic_id}, {"_id": psychic_id}]})
@@ -98,6 +111,7 @@ def create_stripe_connect_router(db: AsyncIOMotorDatabase):
         if not psychic_id or not email:
             raise HTTPException(status_code=400, detail="Missing psychic_id or email")
         
+        await ensure_stripe_key()
         try:
             # Check if psychic already has a Stripe account
             psychic = await db.psychics.find_one({"$or": [{"id": psychic_id}, {"_id": psychic_id}]})
@@ -205,6 +219,7 @@ def create_stripe_connect_router(db: AsyncIOMotorDatabase):
     @router.get("/dashboard-link/{psychic_id}")
     async def get_dashboard_link(psychic_id: str):
         """Get Stripe Express dashboard link for a psychic"""
+        await ensure_stripe_key()
         try:
             psychic = await db.psychics.find_one({"$or": [{"id": psychic_id}, {"_id": psychic_id}]})
             
@@ -275,6 +290,7 @@ def create_stripe_connect_router(db: AsyncIOMotorDatabase):
         fee = max(0.50, round(amount * 0.015, 2)) if is_instant else 0.0
         net_amount = round(amount - fee, 2)
         
+        await ensure_stripe_key()
         try:
             psychic = await db.psychics.find_one({"$or": [{"id": psychic_id}, {"_id": psychic_id}]})
             

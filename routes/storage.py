@@ -1,11 +1,21 @@
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
-from fastapi.responses import FileResponse, Response
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Response, Request
+from fastapi.responses import FileResponse, Response, RedirectResponse
+from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 import uuid
 import base64
 import os
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+class UploadBase64Request(BaseModel):
+    user_id: Optional[str] = "advisor"
+    base64_data: str
+    content_type: Optional[str] = "image/jpeg"
+    purpose: Optional[str] = "profile"
 
 # Storage configuration
 UPLOAD_DIR = Path(__file__).parent.parent / "uploads"
@@ -178,11 +188,15 @@ def create_storage_routes(db):
     
     @router.get("/file/{file_id}")
     async def get_file(file_id: str, format: Optional[str] = None):
-        """Retrieve a file by ID (serves binary image directly for React Native Image and web browsers)"""
+        """Retrieve a file by ID - returns raw image bytes or redirects to CDN"""
         file_doc = await db.files.find_one({"id": file_id})
         if not file_doc:
             raise HTTPException(status_code=404, detail="File not found")
         
+        # If it has a remote Cloudinary URL, redirect to it
+        if file_doc.get("url") and file_doc["url"].startswith("http"):
+            return RedirectResponse(file_doc["url"])
+
         content_type = file_doc.get("content_type", "image/jpeg")
         data = file_doc.get("data", "")
         
@@ -220,19 +234,39 @@ def create_storage_routes(db):
     
     @router.post("/upload-base64")
     async def upload_base64(
-        user_id: str,
-        base64_data: str,
-        content_type: str = "image/jpeg",
-        purpose: str = "profile"
+        request: Request,
+        payload: Optional[UploadBase64Request] = None
     ):
-        """Upload a file from base64 data (for mobile camera uploads)"""
+        """Upload a file from base64 data (supports mobile camera uploads, Cloudinary, and local storage)"""
+        uid = "advisor"
+        b64 = ""
+        ctype = "image/jpeg"
+        purp = "profile"
+
+        if payload:
+            uid = payload.user_id or "advisor"
+            b64 = payload.base64_data or ""
+            ctype = payload.content_type or "image/jpeg"
+            purp = payload.purpose or "profile"
+        else:
+            try:
+                body = await request.json()
+                uid = body.get("user_id", "advisor")
+                b64 = body.get("base64_data", "")
+                ctype = body.get("content_type", "image/jpeg")
+                purp = body.get("purpose", "profile")
+            except Exception:
+                pass
+
+        if not b64:
+            raise HTTPException(status_code=400, detail="Missing base64_data")
         
         # Remove data URL prefix if present
-        if ";base64," in base64_data:
-            base64_data = base64_data.split(";base64,")[1]
+        if ";base64," in b64:
+            b64 = b64.split(";base64,")[1]
         
         try:
-            content = base64.b64decode(base64_data)
+            content = base64.b64decode(b64)
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid base64 data")
         
@@ -241,32 +275,62 @@ def create_storage_routes(db):
             raise HTTPException(status_code=400, detail="File too large. Max 10MB.")
         
         file_id = str(uuid.uuid4())
-        ext = content_type.split("/")[-1]
+
+        # Attempt upload to Cloudinary for permanent CDN URL
+        try:
+            import cloudinary.uploader
+            res = cloudinary.uploader.upload(
+                f"data:{ctype};base64,{b64}",
+                folder="profiles",
+                resource_type="image"
+            )
+            cloud_url = res.get("secure_url") or res.get("url")
+            if cloud_url:
+                await db.files.insert_one({
+                    "id": file_id,
+                    "url": cloud_url,
+                    "content_type": ctype,
+                    "file_type": "image",
+                    "purpose": purp,
+                    "user_id": uid,
+                    "size": len(content),
+                    "created_at": datetime.utcnow()
+                })
+                return {
+                    "success": True,
+                    "file_id": file_id,
+                    "url": cloud_url,
+                    "data_url": cloud_url
+                }
+        except Exception as e:
+            logger.warning(f"Cloudinary upload failed, falling back to db: {e}")
+        
+        ext = ctype.split("/")[-1]
         filename = f"{file_id}.{ext}"
         
         file_doc = {
             "id": file_id,
             "filename": filename,
             "original_name": filename,
-            "content_type": content_type,
+            "content_type": ctype,
             "file_type": "image",
-            "purpose": purpose,
-            "user_id": user_id,
+            "purpose": purp,
+            "user_id": uid,
             "size": len(content),
-            "data": base64_data,
+            "data": b64,
             "created_at": datetime.utcnow()
         }
         
         await db.files.insert_one(file_doc)
         
-        base_url = os.getenv("BACKEND_URL", "")
+        base_url = os.getenv("BACKEND_URL", "http://192.168.29.73:8000")
         file_url = f"{base_url}/api/storage/file/{file_id}"
         
         return {
             "success": True,
             "file_id": file_id,
             "url": file_url,
-            "data_url": f"data:{content_type};base64,{base64_data}"
+            "data_url": f"data:{ctype};base64,{b64}"
         }
     
     @router.get("/user-files/{user_id}")

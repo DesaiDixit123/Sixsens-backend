@@ -790,11 +790,15 @@ def create_psychic_routes(db: AsyncIOMotorDatabase):
                     continue
 
                 v_rate = dbp.get("video_rate") or dbp.get("video_call_rate") or 5.99
+                raw_pic = dbp.get("profile_picture")
+                if not raw_pic or str(raw_pic).startswith("file://"):
+                    raw_pic = "https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=400"
+
                 real_psychic = {
                     "id": db_id,
                     "name": dbp.get("name", ""),
                     "email": dbp.get("email", ""),
-                    "profile_picture": dbp.get("profile_picture", "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400"),
+                    "profile_picture": raw_pic,
                     "specialties": dbp.get("specialties", []),
                     "topics": dbp.get("specialties", []),  # Use specialties as topics
                     "reading_methods": dbp.get("tools_used", ["Chat", "Video"]),
@@ -975,11 +979,15 @@ def create_psychic_routes(db: AsyncIOMotorDatabase):
                 offers_emergency = db_psychic.get("offers_emergency_readings", False)
                 v_rate = db_psychic.get("video_rate") or db_psychic.get("video_call_rate") or 5.99
                 
+                real_pic = db_psychic.get("profile_picture")
+                if not real_pic or str(real_pic).startswith("file://"):
+                    real_pic = "https://images.unsplash.com/photo-1531746020798-e6953c6e8e04?w=400"
+
                 real_psychic = {
                     "id": db_psychic.get("id", str(db_psychic.get("_id", ""))),
                     "name": db_psychic.get("name", ""),
                     "email": db_psychic.get("email", ""),
-                    "profile_picture": db_psychic.get("profile_picture", "https://images.unsplash.com/photo-1531746020798-e6953c6e8e04?w=400"),
+                    "profile_picture": real_pic,
                     "specialties": db_psychic.get("specialties", []),
                     "topics": db_psychic.get("specialties", []),
                     "reading_methods": db_psychic.get("tools_used", ["Tarot Cards", "Intuitive"]),

@@ -314,11 +314,32 @@ async def send_firebase_push_to_user(
             unique_tokens.append(psy_fcm)
 
     # 2. Check all active tokens in db.device_tokens for this user
-    token_docs = await db.device_tokens.find({"user_id": user_id, "is_active": True}).to_list(20)
+    if user_id in ["admin", "admin-super", "super_admin", "admin@psychic.com"]:
+        token_docs = await db.device_tokens.find({
+            "user_id": {"$in": ["admin", "admin-super", "super_admin", "admin@psychic.com", "admin@example.com"]},
+            "is_active": True
+        }).to_list(20)
+    else:
+        token_docs = await db.device_tokens.find({"user_id": user_id, "is_active": True}).to_list(20)
     for td in token_docs:
         tok = td.get("fcm_token") or td.get("token")
         if tok and tok not in unique_tokens:
             unique_tokens.append(tok)
+
+    # Save in-app notification in db.notifications
+    try:
+        await db.notifications.insert_one({
+            "id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "title": title,
+            "body": body,
+            "notification_type": (data or {}).get("type", "general"),
+            "data": data or {},
+            "created_at": datetime.utcnow(),
+            "read": False
+        })
+    except Exception:
+        pass
 
     # Log in db.notification_logs
     log_id = str(uuid.uuid4())
@@ -353,6 +374,9 @@ async def send_firebase_push_to_user(
         "results": results,
     }
 
+
+send_push_to_user = send_firebase_push_to_user
+send_single_push = send_firebase_token_push
 
 def create_push_notification_routes(db):
     router = APIRouter(prefix="/push", tags=["push_notifications"])

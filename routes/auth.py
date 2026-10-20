@@ -541,11 +541,15 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
                 raise HTTPException(status_code=401, detail="Invalid email or password")
             
             psychic_id = db_psychic.get("id") or str(db_psychic.get("_id"))
+            raw_p_pic = db_psychic.get("profile_picture")
+            if not raw_p_pic or str(raw_p_pic).startswith("file://"):
+                raw_p_pic = (MOCK_PSYCHICS.get(email_lower, {}).get("profile_picture")) or "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400"
+
             psychic_data = {
                 "id": psychic_id,
                 "email": db_psychic.get("email"),
                 "name": db_psychic.get("name") or db_psychic.get("full_name", "Advisor"),
-                "profile_picture": db_psychic.get("profile_picture") or (MOCK_PSYCHICS.get(email_lower, {}).get("profile_picture")),
+                "profile_picture": raw_p_pic,
                 "specialties": db_psychic.get("specialties", ["Love & Relationships"]),
                 "years_experience": db_psychic.get("years_experience", 2),
                 "chat_rate": db_psychic.get("chat_rate", 2.99),

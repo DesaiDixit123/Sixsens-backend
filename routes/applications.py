@@ -140,6 +140,32 @@ def create_application_routes(db):
         
         await db.applications.insert_one(new_application.dict())
         
+        # Save applicant push token if provided
+        applicant_token = getattr(application_data, 'device_token', None) or getattr(application_data, 'fcm_token', None)
+        if applicant_token:
+            await db.device_tokens.update_one(
+                {"user_id": application_data.email},
+                {"$set": {
+                    "user_id": application_data.email,
+                    "token": applicant_token,
+                    "platform": "android",
+                    "is_active": True,
+                    "updated_at": datetime.utcnow()
+                }},
+                upsert=True
+            )
+            await db.device_tokens.update_one(
+                {"user_id": new_application.id},
+                {"$set": {
+                    "user_id": new_application.id,
+                    "token": applicant_token,
+                    "platform": "android",
+                    "is_active": True,
+                    "updated_at": datetime.utcnow()
+                }},
+                upsert=True
+            )
+
         # Notify admin of new application
         await create_admin_notification(
             title="New Advisor Application",
@@ -147,6 +173,22 @@ def create_application_routes(db):
             notification_type="new_application",
             related_id=new_application.id
         )
+        try:
+            from routes.push_notifications import send_push_to_user
+            await send_push_to_user(
+                db,
+                user_id="admin",
+                title="New Advisor Application! 📝",
+                body=f"{application_data.full_name} from {application_data.country} has submitted an application.",
+                data={
+                    "type": "new_application",
+                    "application_id": str(new_application.id),
+                    "applicant_name": str(application_data.full_name),
+                    "email": str(application_data.email)
+                }
+            )
+        except Exception as e:
+            print(f"Push to admin error: {e}")
         
         # Send confirmation email to applicant
         await send_email(
