@@ -198,7 +198,6 @@ async def send_firebase_token_push(token: str, title: str, body: str, data: dict
             priority='high',
             notification=messaging.AndroidNotification(
                 sound='default',
-                click_action='FLUTTER_NOTIFICATION_CLICK',
                 channel_id='high_importance_channel'
             )
         )
