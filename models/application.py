@@ -10,6 +10,7 @@ class PsychicApplication(BaseModel):
     email: str
     phone: str
     country: str
+    profile_picture: Optional[str] = None
     # Experience
     years_experience: str
     specialties: List[str] = []
@@ -47,6 +48,7 @@ class ApplicationCreate(BaseModel):
     email: str
     phone: str
     country: str
+    profile_picture: Optional[str] = None
     years_experience: str
     specialties: List[str] = []
     love_services: List[str] = []
@@ -72,6 +74,7 @@ class ApplicationResponse(BaseModel):
     email: str
     phone: str
     country: str
+    profile_picture: Optional[str] = None
     years_experience: str
     specialties: List[str]
     love_services: List[str]

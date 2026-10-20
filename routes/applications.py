@@ -75,9 +75,11 @@ def create_application_routes(db):
         - Notifies admin of new application
         - Sends confirmation email to applicant
         """
+        email_clean = application_data.email.lower().strip()
+
         # Check if email already has a pending application
         existing = await db.applications.find_one({
-            "email": application_data.email,
+            "email": email_clean,
             "status": {"$in": ["pending", "under_review"]}
         })
         if existing:
@@ -86,16 +88,20 @@ def create_application_routes(db):
                 detail="You already have a pending application. Please wait for review."
             )
         
-        # Check if email was previously rejected - no reapplications allowed
-        rejected = await db.applications.find_one({
-            "email": application_data.email,
+        # Remove any previous old/rejected applications for this email to avoid duplicate or stale records
+        await db.applications.delete_many({
+            "email": email_clean
+        })
+        
+        # Clean up any stale rejected psychic/user accounts if resubmitting
+        await db.psychics.delete_many({
+            "email": email_clean,
             "status": "rejected"
         })
-        if rejected:
-            raise HTTPException(
-                status_code=403,
-                detail="Your previous application was not approved. You cannot submit a new application."
-            )
+        await db.users.delete_many({
+            "email": email_clean,
+            "status": "rejected"
+        })
         
         # Hash password if provided
         password_hash = None
@@ -110,6 +116,7 @@ def create_application_routes(db):
             email=application_data.email,
             phone=application_data.phone,
             country=application_data.country,
+            profile_picture=application_data.profile_picture,
             years_experience=application_data.years_experience,
             specialties=application_data.specialties,
             love_services=application_data.love_services,
@@ -262,19 +269,74 @@ The Psychic Advisor Team
     
     @router.get("/email/{email}")
     async def get_application_by_email(email: str):
-        """Get full application data by email (for login flow)"""
-        application = await db.applications.find_one({"email": email.lower()})
+        """Get full application data by email"""
+        application = await db.applications.find_one(
+            {"email": email.lower().strip()},
+            sort=[("created_at", -1)]
+        )
         if not application:
             return None
-        return {
-            "id": application.get("id"),
-            "email": application.get("email"),
-            "full_name": application.get("full_name"),
-            "status": application.get("status"),
-            "rejection_reason": application.get("rejection_reason"),
-            "created_at": application.get("created_at"),
-            "reviewed_at": application.get("reviewed_at")
+        
+        app_data = dict(application)
+        if "_id" in app_data:
+            app_data["_id"] = str(app_data["_id"])
+        if "created_at" in app_data and isinstance(app_data["created_at"], datetime):
+            app_data["created_at"] = app_data["created_at"].isoformat()
+        if "reviewed_at" in app_data and isinstance(app_data["reviewed_at"], datetime):
+            app_data["reviewed_at"] = app_data["reviewed_at"].isoformat()
+        app_data.pop("password_hash", None)
+        return app_data
+
+    @router.post("/support-query")
+    async def submit_application_support_query(body: dict):
+        """Submit a query from an applicant under review or rejected to admin"""
+        email = body.get("email", "").lower().strip()
+        name = body.get("name", "Applicant")
+        subject = body.get("subject", "Application Status Inquiry")
+        message = body.get("message", "").strip()
+
+        if not message:
+            raise HTTPException(status_code=400, detail="Message is required")
+
+        ticket_id = str(uuid.uuid4())
+        now = datetime.utcnow()
+        ticket_doc = {
+            "id": ticket_id,
+            "ticket_id": ticket_id,
+            "email": email,
+            "name": name,
+            "subject": subject,
+            "message": message,
+            "category": "advisor_application",
+            "status": "open",
+            "created_at": now
         }
+        await db.support_tickets.insert_one(ticket_doc)
+
+        # Send notification to admin
+        notif_doc = {
+            "id": str(uuid.uuid4()),
+            "user_id": "admin",
+            "user_type": "admin",
+            "title": f"📩 Applicant Query: {name} ({subject})",
+            "body": f"From {email}: \"{message[:120]}\"",
+            "type": "support_query",
+            "notification_type": "support_query",
+            "related_id": ticket_id,
+            "is_read": False,
+            "created_at": now,
+            "data": {
+                "type": "applicant_query",
+                "ticket_id": ticket_id,
+                "email": email,
+                "name": name,
+                "subject": subject,
+                "message": message
+            }
+        }
+        await db.notifications.insert_one(notif_doc)
+
+        return {"success": True, "ticket_id": ticket_id, "message": "Your query has been sent to the Admin"}
     
     @router.get("/psychic/{psychic_identifier}")
     async def get_application_by_psychic(psychic_identifier: str):
@@ -393,6 +455,7 @@ The Psychic Advisor Team
                 "email": applicant_email,
                 "phone": application.get("phone"),
                 "country": application.get("country"),
+                "profile_picture": application.get("profile_picture"),
                 "specialties": application.get("specialties", ["Love & Relationships"]),
                 "bio": application.get("bio", ""),
                 "years_experience": application.get("years_experience", 2),
@@ -425,6 +488,7 @@ The Psychic Advisor Team
                     "id": psychic_id,
                     "name": applicant_name,
                     "email": applicant_email,
+                    "profile_picture": application.get("profile_picture"),
                     "password_hash": application.get("password_hash"),
                     "user_type": "psychic",
                     "is_verified": True,

@@ -50,6 +50,10 @@ class AdminStats(BaseModel):
     total_psychics: int = 0
     active_sessions: int = 0
     total_revenue: float = 0
+    today_revenue: float = 0
     pending_withdrawals: int = 0
     pending_refunds: int = 0
     pending_applications: int = 0
+    total_readings: int = 0
+    active_users: int = 0
+    online_psychics: int = 0

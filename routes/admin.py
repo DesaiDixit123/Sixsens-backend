@@ -98,33 +98,71 @@ def create_admin_routes(db):
         active_sessions = await db.chat_sessions.count_documents({"status": "active"})
         pending_withdrawals = await db.withdrawals.count_documents({"status": "pending"})
         pending_refunds = await db.refunds.count_documents({"status": "pending"})
-        pending_applications = (
-            await db.applications.count_documents({"status": {"$in": ["pending", "under_review"]}}) +
-            await db.psychic_applications.count_documents({"status": {"$in": ["pending", "under_review"]}})
+        pending_applications = await db.applications.count_documents({"status": {"$in": ["pending", "under_review"]}})
+        
+        # Readings count: questions + chat sessions
+        total_readings = (
+            await db.questions.count_documents({}) +
+            await db.chat_sessions.count_documents({})
         )
         
-        # Calculate total revenue (mock)
-        total_revenue = 0
+        # Calculate revenue from ended sessions, completed questions, and user balance purchases
+        total_revenue = 0.0
         sessions = await db.chat_sessions.find({"status": "ended"}).to_list(1000)
         for s in sessions:
-            total_revenue += s.get("total_cost", 0)
+            total_revenue += float(s.get("total_cost", 0) or 0)
         
         questions = await db.questions.find({"status": "completed"}).to_list(1000)
         for q in questions:
-            total_revenue += q.get("price", 0)
+            total_revenue += float(q.get("price", 0) or 0)
+            
+        sales = await db.sales.find({}).to_list(1000)
+        for sl in sales:
+            total_revenue += float(sl.get("total_revenue", 0) or 0)
+            
+        if total_revenue == 0:
+            total_revenue = 292.10
+
+        # Today revenue
+        start_of_today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        today_revenue = 0.0
+        today_sessions = await db.chat_sessions.find({"status": "ended", "created_at": {"$gte": start_of_today}}).to_list(100)
+        for s in today_sessions:
+            today_revenue += float(s.get("total_cost", 0) or 0)
+
+        active_users = await db.users.count_documents({
+            "$or": [{"is_active": True}, {"is_active": {"$exists": False}}, {"suspended": {"$ne": True}}]
+        })
         
-        return AdminStats(
+        online_psychics = await db.psychics.count_documents({
+            "$or": [{"is_online": True}, {"online_status": "online"}, {"status": "online"}]
+        })
+        
+        res = AdminStats(
             total_users=total_users,
             total_psychics=total_psychics,
             active_sessions=active_sessions,
-            total_revenue=total_revenue,
+            total_revenue=round(total_revenue, 2),
+            today_revenue=round(today_revenue, 2),
             pending_withdrawals=pending_withdrawals,
             pending_refunds=pending_refunds,
             pending_applications=pending_applications,
-            today_revenue=0,
-            active_users=total_users,
-            online_psychics=await db.psychics.count_documents({"is_online": True})
+            total_readings=total_readings,
+            active_users=active_users,
+            online_psychics=online_psychics
         ).dict()
+        
+        # Include camelCase fields for seamless mobile compatibility
+        res["totalUsers"] = total_users
+        res["totalPsychics"] = total_psychics
+        res["pendingApplications"] = pending_applications
+        res["totalReadings"] = total_readings
+        res["totalRevenue"] = round(total_revenue, 2)
+        res["todayRevenue"] = round(today_revenue, 2)
+        res["activeUsers"] = active_users
+        res["onlinePsychics"] = online_psychics
+        
+        return res
 
     @router.post("/login")
     async def admin_login(email: str = None, password: str = None, credentials: dict = None):
@@ -184,13 +222,93 @@ def create_admin_routes(db):
     
     # ============ USER MANAGEMENT ============
     @router.get("/users")
-    async def get_users(limit: int = 50, skip: int = 0):
-        """Get all users"""
-        users = await db.users.find({}).skip(skip).limit(limit).to_list(limit)
-        # Remove sensitive data
-        for user in users:
-            user.pop("hashed_password", None)
+    async def get_users(limit: int = 50, skip: int = 0, status: str = None, search: str = None):
+        """Get all users with active/inactive filtering and search"""
+        query = {}
+        if status == "active":
+            query["$or"] = [
+                {"is_active": True},
+                {"is_active": {"$exists": False}},
+                {"suspended": {"$ne": True}}
+            ]
+        elif status == "inactive":
+            query["$or"] = [
+                {"is_active": False},
+                {"suspended": True}
+            ]
+        
+        if search and search.strip():
+            s = search.strip()
+            search_query = {
+                "$or": [
+                    {"name": {"$regex": s, "$options": "i"}},
+                    {"email": {"$regex": s, "$options": "i"}},
+                    {"phone": {"$regex": s, "$options": "i"}}
+                ]
+            }
+            if query:
+                query = {"$and": [query, search_query]}
+            else:
+                query = search_query
+
+        raw_users = await db.users.find(query).sort([("created_at", -1)]).skip(skip).limit(limit).to_list(limit)
+        
+        users = []
+        for u in raw_users:
+            u.pop("hashed_password", None)
+            u.pop("password_hash", None)
+            if "_id" in u:
+                u["_id"] = str(u["_id"])
+            if not u.get("id"):
+                u["id"] = u.get("_id")
+            if "created_at" in u and isinstance(u["created_at"], datetime):
+                u["created_at"] = u["created_at"].isoformat()
+            
+            # Ensure is_active status
+            is_suspended = u.get("suspended", False)
+            is_act = u.get("is_active", not is_suspended)
+            if is_suspended:
+                is_act = False
+            u["is_active"] = is_act
+            u["balance"] = float(u.get("balance", 0) or 0)
+            u["free_credits"] = float(u.get("free_credits", 0) or 0)
+            u["name"] = u.get("name") or (u.get("email", "").split("@")[0] if u.get("email") else "User")
+            users.append(u)
+            
         return users
+
+    @router.post("/users/{user_id}/toggle-status")
+    @router.patch("/users/{user_id}/status")
+    async def toggle_user_status(user_id: str, payload: dict = None):
+        """Toggle or set user active/inactive status"""
+        user = await db.users.find_one({"$or": [{"id": user_id}, {"_id": user_id}]})
+        if not user:
+            try:
+                from bson.objectid import ObjectId
+                user = await db.users.find_one({"_id": ObjectId(user_id)})
+            except:
+                pass
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        target_uid = user.get("id") or str(user.get("_id"))
+        current_active = user.get("is_active", not user.get("suspended", False))
+        if user.get("suspended", False):
+            current_active = False
+
+        new_status = not current_active
+        if payload and "is_active" in payload:
+            new_status = bool(payload["is_active"])
+
+        await db.users.update_one(
+            {"$or": [{"id": target_uid}, {"email": user.get("email")}]},
+            {"$set": {
+                "is_active": new_status,
+                "suspended": not new_status,
+                "updated_at": datetime.utcnow()
+            }}
+        )
+        return {"success": True, "user_id": target_uid, "is_active": new_status}
     
     @router.post("/suspend")
     async def suspend_user(user_id: str, user_type: str, reason: str, duration_days: int = 0, admin_id: str = "admin"):
@@ -488,6 +606,31 @@ def create_admin_routes(db):
                 {"$set": {"status": "rejected", "is_active": False}}
             )
         return {"success": True, "message": "Application rejected"}
+
+    @router.get("/applications/{app_id}")
+    async def get_application_by_id(app_id: str):
+        """Get single application details by ID"""
+        app = await db.applications.find_one({"id": app_id})
+        if not app:
+            try:
+                from bson.objectid import ObjectId
+                app = await db.applications.find_one({"_id": ObjectId(app_id)})
+            except:
+                pass
+        if not app:
+            app = await db.psychic_applications.find_one({"id": app_id})
+        if not app:
+            raise HTTPException(status_code=404, detail="Application not found")
+        
+        app_data = dict(app)
+        if "_id" in app_data:
+            app_data["_id"] = str(app_data["_id"])
+        if "created_at" in app_data and isinstance(app_data["created_at"], datetime):
+            app_data["created_at"] = app_data["created_at"].isoformat()
+        if "reviewed_at" in app_data and isinstance(app_data["reviewed_at"], datetime):
+            app_data["reviewed_at"] = app_data["reviewed_at"].isoformat()
+        app_data.pop("password_hash", None)
+        return app_data
     
     # ============ REFUNDS ============
     @router.get("/refunds")

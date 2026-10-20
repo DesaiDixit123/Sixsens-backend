@@ -495,21 +495,22 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
         
         email_lower = credentials.email.lower().strip()
         
-        # 1. Check if application was rejected
-        rejected_app = await db.applications.find_one({"email": email_lower, "status": "rejected"})
-        if rejected_app:
-            raise HTTPException(
-                status_code=403,
-                detail="Your application was not approved. You cannot log in as an advisor."
-            )
-        
-        # 2. Check if application is pending or under review
-        pending_app = await db.applications.find_one({"email": email_lower, "status": {"$in": ["pending", "under_review"]}})
-        if pending_app:
-            raise HTTPException(
-                status_code=403,
-                detail="Your application is currently under review. Please wait for administrator approval."
-            )
+        # 1. Check latest advisor application status first
+        latest_app = await db.applications.find_one(
+            {"email": email_lower},
+            sort=[("created_at", -1)]
+        )
+        if latest_app:
+            if latest_app.get("status") in ["pending", "under_review"]:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Your application is currently under review. Please wait for administrator approval."
+                )
+            elif latest_app.get("status") == "rejected":
+                raise HTTPException(
+                    status_code=403,
+                    detail="Your application was not approved. You cannot log in as an advisor."
+                )
         
         # 3. Check real MongoDB database first
         db_psychic = await db.psychics.find_one({"email": email_lower})
