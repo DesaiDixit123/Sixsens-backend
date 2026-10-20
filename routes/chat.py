@@ -964,6 +964,43 @@ def create_chat_routes(db):
             }
         )
 
+        # Record client transaction deduction in db.transactions
+        if client_id and total_cost > 0:
+            try:
+                psychic = await db.psychics.find_one({"$or": [{"id": psychic_id}, {"email": session.get("psychic_email")}]})
+                psychic_name = (psychic.get("name") if psychic else None) or session.get("psychic_name") or "Psychic Advisor"
+                s_type = (session.get("session_type") or "chat").lower()
+                type_label = "Audio Call" if s_type in ["phone", "voice", "audio"] else ("Video Call" if s_type == "video" else "Chat Reading")
+                clean_sid = session_id.replace("-", "")[:16]
+                tx_id = f"tx_sess_{clean_sid}"
+                await db.transactions.update_one(
+                    {"session_id": session_id, "user_id": client_id},
+                    {
+                        "$set": {
+                            "id": tx_id,
+                            "transaction_id": tx_id,
+                            "user_id": client_id,
+                            "client_id": client_id,
+                            "type": "session_deduction",
+                            "session_type": s_type,
+                            "session_id": session_id,
+                            "psychic_id": psychic_id,
+                            "psychic_name": psychic_name,
+                            "amount": total_cost,
+                            "duration_minutes": duration_minutes,
+                            "duration_seconds": duration_seconds,
+                            "rate_per_minute": rate,
+                            "description": f"{type_label} with {psychic_name} ({duration_minutes} min @ ${rate:.2f}/min)",
+                            "status": "completed",
+                            "created_at": now_utc,
+                            "updated_at": now_utc,
+                        }
+                    },
+                    upsert=True
+                )
+            except Exception as tx_err:
+                print(f"[WALLET] Error recording session transaction: {tx_err}")
+
         end_message = {
             "type": "session_ended",
             "session_id": session_id,

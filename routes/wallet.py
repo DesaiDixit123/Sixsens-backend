@@ -62,9 +62,20 @@ async def _db(coro):
 
 def _serialize_tx(t: dict) -> dict:
     t["_id"] = str(t.get("_id", t.get("id", "")))
-    created_at = t.get("created_at")
-    if isinstance(created_at, datetime):
-        t["created_at"] = created_at.isoformat()
+    for date_key in ["created_at", "updated_at", "ended_at", "started_at"]:
+        val = t.get(date_key)
+        if isinstance(val, datetime):
+            t[date_key] = val.isoformat()
+    if "amount" in t and t["amount"] is not None:
+        try:
+            t["amount"] = float(t["amount"])
+        except Exception:
+            pass
+    if "duration_minutes" in t and t["duration_minutes"] is not None:
+        try:
+            t["duration_minutes"] = float(t["duration_minutes"])
+        except Exception:
+            pass
     return t
 
 
@@ -106,7 +117,7 @@ def create_wallet_routes(db: AsyncIOMotorDatabase):
 
     # ---- Transactions (declared before "/{user_id}" so "/transactions" isn't captured by it) ----
     @router.get("/transactions")
-    async def get_transactions(token: Optional[str] = None, user_id: Optional[str] = None, limit: int = 20):
+    async def get_transactions(token: Optional[str] = None, user_id: Optional[str] = None, limit: int = 100):
         uid = user_id
         if not uid and token:
             try:
@@ -117,18 +128,98 @@ def create_wallet_routes(db: AsyncIOMotorDatabase):
         if not uid:
             raise HTTPException(status_code=400, detail="user_id or token required")
 
+        # 1. Fetch transactions from db.transactions
         transactions = await _db(
-            db.transactions.find({"user_id": uid}).sort("created_at", -1).limit(limit).to_list(limit)
+            db.transactions.find({"$or": [{"user_id": uid}, {"client_id": uid}]}).sort("created_at", -1).limit(limit).to_list(limit)
         )
         if not transactions:
             # Legacy records written to the old collection
             transactions = await _db(
-                db.wallet_transactions.find({"user_id": uid}).sort("created_at", -1).limit(limit).to_list(limit)
+                db.wallet_transactions.find({"$or": [{"user_id": uid}, {"client_id": uid}]}).sort("created_at", -1).limit(limit).to_list(limit)
             )
-        return [_serialize_tx(t) for t in transactions]
+
+        # 2. Check for any ended chat/voice/video sessions that might not yet be in db.transactions
+        existing_session_ids = {t.get("session_id") for t in transactions if t.get("session_id")}
+        ended_sessions = await _db(
+            db.chat_sessions.find({"client_id": uid, "status": "ended"}).sort("ended_at", -1).limit(limit).to_list(limit)
+        )
+
+        new_session_txs = []
+        for s in ended_sessions:
+            sid = s.get("id")
+            if not sid or sid in existing_session_ids:
+                continue
+
+            stype = (s.get("session_type") or "chat").lower()
+            if stype in ["phone", "voice", "audio"]:
+                stype = "phone"
+                type_label = "Audio Call"
+            elif stype == "video":
+                type_label = "Video Call"
+            else:
+                stype = "chat"
+                type_label = "Chat Reading"
+
+            mins = round(float(s.get("total_minutes", 0) or 0), 2)
+            rate = float(s.get("rate_per_minute", 2.99) or 2.99)
+            cost = round(float(s.get("total_cost", 0) or (mins * rate)), 2)
+            if cost <= 0:
+                cost = round(max(1.0, mins) * rate, 2)
+
+            created_at = s.get("ended_at") or s.get("started_at") or datetime.utcnow()
+            dur_secs = int(s.get("duration_seconds", 0) or int(mins * 60))
+
+            psy_name = s.get("psychic_name")
+            if not psy_name:
+                psy = await db.psychics.find_one({"$or": [{"id": s.get("psychic_id")}, {"email": s.get("psychic_email")}]})
+                psy_name = psy.get("name") if psy else "Psychic Advisor"
+
+            clean_sid = sid.replace("-", "")[:16]
+            tx_doc = {
+                "id": f"tx_sess_{clean_sid}",
+                "transaction_id": f"tx_sess_{clean_sid}",
+                "user_id": uid,
+                "client_id": uid,
+                "type": "session_deduction",
+                "session_type": stype,
+                "session_id": sid,
+                "psychic_id": s.get("psychic_id"),
+                "psychic_name": psy_name,
+                "amount": cost,
+                "duration_minutes": mins,
+                "duration_seconds": dur_secs,
+                "rate_per_minute": rate,
+                "description": f"{type_label} with {psy_name} ({mins} min @ ${rate:.2f}/min)",
+                "status": "completed",
+                "created_at": created_at,
+                "updated_at": created_at,
+            }
+
+            try:
+                await db.transactions.update_one(
+                    {"session_id": sid, "user_id": uid},
+                    {"$set": tx_doc},
+                    upsert=True
+                )
+            except Exception:
+                pass
+
+            new_session_txs.append(tx_doc)
+            existing_session_ids.add(sid)
+
+        all_txs = transactions + new_session_txs
+
+        def get_sort_key(tx):
+            dt = tx.get("created_at")
+            if isinstance(dt, datetime):
+                return dt.isoformat()
+            return str(dt or "")
+
+        all_txs.sort(key=get_sort_key, reverse=True)
+        return [_serialize_tx(t) for t in all_txs[:limit]]
 
     @router.get("/transactions/{user_id}")
-    async def get_transactions_by_user_id(user_id: str, limit: int = 20):
+    async def get_transactions_by_user_id(user_id: str, limit: int = 100):
         return await get_transactions(user_id=user_id, limit=limit)
 
     # ---- Payment methods ----
