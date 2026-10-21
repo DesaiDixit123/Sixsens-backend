@@ -530,14 +530,23 @@ def create_chat_routes(db):
         rate = request.get("rate_per_minute", 2.99)
         initial_minutes = request.get("requested_minutes", 5)
         s_type = request.get("session_type", "chat")
-        
+
+        client_user = await db.users.find_one({"id": request.get("client_id")})
+        is_free_chat = (
+            s_type == "chat"
+            and client_user is not None
+            and not client_user.get("first_reading_free_used", False)
+        )
+
+        initial_cost = 0.0 if is_free_chat else (rate * initial_minutes)
+
         new_session = ChatSession(
             client_id=request["client_id"],
             psychic_id=request["psychic_id"],
             session_type=s_type,
             rate_per_minute=rate,
             auto_end_minutes=initial_minutes,
-            total_cost=rate * initial_minutes
+            total_cost=initial_cost
         )
         
         # Generate Agora RTC credentials for audio/video calls (and even available if switched in chat)
@@ -567,6 +576,8 @@ def create_chat_routes(db):
         session_doc["psychic_uid"] = psychic_uid
         session_doc["client_token"] = client_token
         session_doc["psychic_token"] = psychic_token
+        session_doc["free_minutes_used"] = is_free_chat
+        session_doc["free_minutes"] = 4 if is_free_chat else 0
         await db.chat_sessions.insert_one(session_doc)
         if "_id" in session_doc:
             session_doc["_id"] = str(session_doc["_id"])
@@ -930,9 +941,18 @@ def create_chat_routes(db):
         duration_minutes = round(duration_seconds / 60.0, 2)
         rate = float(session.get("rate_per_minute", 2.99))
 
-        # Bill minimum 1 minute (or exact pro-rata minutes if > 1 minute) so every live session has a clear billable amount
-        billable_minutes = max(1.0, duration_minutes)
-        total_cost = round(billable_minutes * rate, 2)
+        # Handle 4 minutes free chat offer
+        free_minutes_used = session.get("free_minutes_used", False)
+        if free_minutes_used:
+            # First 4 minutes (240s) are 100% free for the client
+            billable_seconds = max(0, duration_seconds - 240)
+            billable_minutes = round(billable_seconds / 60.0, 2)
+            total_cost = round(billable_minutes * rate, 2)
+        else:
+            # Bill minimum 1 minute (or exact pro-rata minutes if > 1 minute)
+            billable_minutes = max(1.0, duration_minutes)
+            total_cost = round(billable_minutes * rate, 2)
+
         psychic_earnings = round(total_cost * 0.40, 2)
 
         client_id = session.get("client_id")

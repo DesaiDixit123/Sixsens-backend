@@ -355,14 +355,17 @@ def create_wallet_routes(db: AsyncIOMotorDatabase):
         user = await _get_user_or_404(user_id)
         balance = float(user.get("balance", 0.0) or 0.0)
         free_credits = float(user.get("free_credits", 0.0) or 0.0)
+        first_reading_free_used = bool(user.get("first_reading_free_used", False))
         free_minutes_available = int(user.get("free_minutes_available", 0) or 0)
-        has_free_offer = (free_credits > 0 or free_minutes_available > 0) and not user.get("first_reading_free_used", False)
+        if not first_reading_free_used and free_minutes_available == 0:
+            free_minutes_available = 4
+
         return WalletResponse(
             balance=balance,
             free_credits=free_credits,
             total_available=balance,
-            is_new_user=bool(user.get("is_new_user", False) and has_free_offer),
-            first_reading_free_used=bool(user.get("first_reading_free_used", False) or not has_free_offer),
+            is_new_user=bool(user.get("is_new_user", True) and not first_reading_free_used),
+            first_reading_free_used=first_reading_free_used,
             free_minutes_available=free_minutes_available,
             payment_methods=[PaymentMethod(**pm) for pm in user.get("saved_payment_methods", [])
                              if pm.get("id") and pm.get("type") and pm.get("last_four")]

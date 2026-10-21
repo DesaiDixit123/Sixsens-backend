@@ -300,7 +300,8 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
             zodiac_sign=zodiac,
             fcm_token=effective_fcm,
             is_new_user=True,  # First reading gets 4 free minutes
-            first_reading_free_used=False
+            first_reading_free_used=False,
+            free_minutes_available=4
         )
         
         # Store with hashed password
@@ -366,6 +367,7 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
                     fcm_token=credentials.fcm_token or f"fcm_{new_uid}_{uuid.uuid4().hex[:16]}",
                     is_new_user=True,
                     first_reading_free_used=False,
+                    free_minutes_available=4,
                 )
                 user_dict = new_user.dict()
                 user_dict["password_hash"] = hash_password(credentials.password)
@@ -867,6 +869,7 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
                 profile_picture=google_picture,
                 is_new_user=True,
                 first_reading_free_used=False,
+                free_minutes_available=4,
                 auth_provider="google"
             )
             
@@ -948,6 +951,7 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
                 profile_picture=google_picture,
                 is_new_user=True,
                 first_reading_free_used=False,
+                free_minutes_available=4,
                 auth_provider="google"
             )
             
@@ -1213,6 +1217,7 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
                 google_id=google_id,
                 is_new_user=True,
                 first_reading_free_used=False,
+                free_minutes_available=4,
                 auth_provider="google"
             )
             user_dict = user.dict()
