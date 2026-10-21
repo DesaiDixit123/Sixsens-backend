@@ -7,6 +7,7 @@ import uuid
 ADVISOR_ALIASES = {
     "psy-001",
     "64ea86f6-968a-4dfc-8c98-1a322fb020c0",
+    "6ad8404c91aa72ec5152b40b",
     "testpsychic@sixthsense.com",
     "luna@psychic.com",
 }

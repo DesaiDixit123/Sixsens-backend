@@ -542,15 +542,31 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
             else:
                 raise HTTPException(status_code=401, detail="Invalid email or password")
             
-            psychic_id = db_psychic.get("id") or str(db_psychic.get("_id"))
+            if email_lower in ("testpsychic@sixthsense.com", "luna@psychic.com"):
+                psychic_id = "64ea86f6-968a-4dfc-8c98-1a322fb020c0"
+                if not db_psychic.get("id"):
+                    try:
+                        await db.psychics.update_one(
+                            {"_id": db_psychic["_id"]},
+                            {"$set": {"id": psychic_id, "name": "Luna Starweaver"}}
+                        )
+                    except Exception:
+                        pass
+            else:
+                psychic_id = db_psychic.get("id") or str(db_psychic.get("_id"))
+
             raw_p_pic = db_psychic.get("profile_picture")
             if not raw_p_pic or str(raw_p_pic).startswith("file://"):
                 raw_p_pic = (MOCK_PSYCHICS.get(email_lower, {}).get("profile_picture")) or "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400"
 
+            resolved_name = db_psychic.get("name") or db_psychic.get("full_name") or "Advisor"
+            if resolved_name == "Advisor" and email_lower in ("testpsychic@sixthsense.com", "luna@psychic.com"):
+                resolved_name = "Luna Starweaver"
+
             psychic_data = {
                 "id": psychic_id,
-                "email": db_psychic.get("email"),
-                "name": db_psychic.get("name") or db_psychic.get("full_name", "Advisor"),
+                "email": db_psychic.get("email") or email_lower,
+                "name": resolved_name,
                 "profile_picture": raw_p_pic,
                 "specialties": db_psychic.get("specialties", ["Love & Relationships"]),
                 "years_experience": db_psychic.get("years_experience", 2),
@@ -564,9 +580,9 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
             }
 
             # Enrich with real dynamic reviews & earnings from database
-            alias_list = [psychic_id, db_psychic.get("email"), email_lower]
-            if email_lower in ("testpsychic@sixthsense.com", "luna@psychic.com") or psychic_id in ("64ea86f6-968a-4dfc-8c98-1a322fb020c0", "psy-001"):
-                alias_list.extend(["psy-001", "64ea86f6-968a-4dfc-8c98-1a322fb020c0", "testpsychic@sixthsense.com"])
+            alias_list = [psychic_id, str(db_psychic.get("_id", "")), db_psychic.get("email"), email_lower]
+            if email_lower in ("testpsychic@sixthsense.com", "luna@psychic.com") or psychic_id in ("64ea86f6-968a-4dfc-8c98-1a322fb020c0", "psy-001", "6ad8404c91aa72ec5152b40b"):
+                alias_list.extend(["psy-001", "64ea86f6-968a-4dfc-8c98-1a322fb020c0", "6ad8404c91aa72ec5152b40b", "testpsychic@sixthsense.com", "luna@psychic.com"])
             alias_list = list(dict.fromkeys([a for a in alias_list if a]))
             try:
                 rev_docs = await db.reviews.find({"$or": [{"psychic_id": {"$in": alias_list}}, {"psychic_email": {"$in": alias_list}}]}).to_list(500)
@@ -580,8 +596,12 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
                 pass
             try:
                 s_docs = await db.chat_sessions.find({"$or": [{"psychic_id": {"$in": alias_list}}, {"psychic_email": {"$in": alias_list}}], "status": "ended"}).to_list(2000)
+                t_docs = await db.tips.find({"$or": [{"psychic_id": {"$in": alias_list}}, {"psychic_email": {"$in": alias_list}}]}).to_list(1000)
                 psychic_data["total_readings"] = len(s_docs)
-                computed_earn = sum(float(s.get("psychic_earnings") if s.get("psychic_earnings") is not None else round(float(s.get("total_cost", 0) or 0) * 0.40, 2)) for s in s_docs)
+                computed_earn = (
+                    sum(float(s.get("psychic_earnings") if s.get("psychic_earnings") is not None else round(float(s.get("total_cost", 0) or 0) * 0.40, 2)) for s in s_docs)
+                    + sum(float(t.get("amount", 0) or 0) for t in t_docs)
+                )
                 psychic_data["total_earnings"] = round(computed_earn, 2)
                 psychic_data["available_balance"] = round(computed_earn, 2)
             except Exception:
@@ -604,8 +624,8 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
         
         # Enrich mock account with real dynamic reviews & earnings from database
         alias_list = [psychic_data.get("id"), psychic_data.get("email"), email_lower]
-        if email_lower in ("testpsychic@sixthsense.com", "luna@psychic.com") or psychic_data.get("id") in ("64ea86f6-968a-4dfc-8c98-1a322fb020c0", "psy-001"):
-            alias_list.extend(["psy-001", "64ea86f6-968a-4dfc-8c98-1a322fb020c0", "testpsychic@sixthsense.com"])
+        if email_lower in ("testpsychic@sixthsense.com", "luna@psychic.com") or psychic_data.get("id") in ("64ea86f6-968a-4dfc-8c98-1a322fb020c0", "psy-001", "6ad8404c91aa72ec5152b40b"):
+            alias_list.extend(["psy-001", "64ea86f6-968a-4dfc-8c98-1a322fb020c0", "6ad8404c91aa72ec5152b40b", "testpsychic@sixthsense.com", "luna@psychic.com"])
         alias_list = list(dict.fromkeys([a for a in alias_list if a]))
         try:
             rev_docs = await db.reviews.find({"$or": [{"psychic_id": {"$in": alias_list}}, {"psychic_email": {"$in": alias_list}}]}).to_list(500)
@@ -619,8 +639,12 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
             pass
         try:
             s_docs = await db.chat_sessions.find({"$or": [{"psychic_id": {"$in": alias_list}}, {"psychic_email": {"$in": alias_list}}], "status": "ended"}).to_list(2000)
+            t_docs = await db.tips.find({"$or": [{"psychic_id": {"$in": alias_list}}, {"psychic_email": {"$in": alias_list}}]}).to_list(1000)
             psychic_data["total_readings"] = len(s_docs)
-            computed_earn = sum(float(s.get("psychic_earnings") if s.get("psychic_earnings") is not None else round(float(s.get("total_cost", 0) or 0) * 0.40, 2)) for s in s_docs)
+            computed_earn = (
+                sum(float(s.get("psychic_earnings") if s.get("psychic_earnings") is not None else round(float(s.get("total_cost", 0) or 0) * 0.40, 2)) for s in s_docs)
+                + sum(float(t.get("amount", 0) or 0) for t in t_docs)
+            )
             psychic_data["total_earnings"] = round(computed_earn, 2)
             psychic_data["available_balance"] = round(computed_earn, 2)
         except Exception:

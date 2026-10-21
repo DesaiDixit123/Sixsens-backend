@@ -9,13 +9,30 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.psychic_profile import PsychicApplication, PsychicDashboard, PsychicSettings
 from models.withdrawal import Withdrawal, WithdrawalCreate, MINIMUM_WITHDRAWAL
 
+LUNA_ALIASES = (
+    "64ea86f6-968a-4dfc-8c98-1a322fb020c0",
+    "psy-001",
+    "6ad8404c91aa72ec5152b40b",
+    "testpsychic@sixthsense.com",
+    "luna@psychic.com",
+)
+
+ADVISOR1_ALIASES = (
+    "psychic-001",
+    "6acb56c6c1e7433d353832a4",
+    "advisor@psychic.com",
+)
+
 def get_psychic_alias_ids(psychic_id: str, email: Optional[str] = None) -> List[str]:
     """Helper to return all recognized ID and email aliases for a psychic"""
     aliases = [psychic_id]
     if email:
         aliases.append(email)
-    if psychic_id in ("64ea86f6-968a-4dfc-8c98-1a322fb020c0", "psy-001", "testpsychic@sixthsense.com", "luna@psychic.com") or (email and email in ("testpsychic@sixthsense.com", "luna@psychic.com")):
-        aliases.extend(["64ea86f6-968a-4dfc-8c98-1a322fb020c0", "psy-001", "testpsychic@sixthsense.com", "luna@psychic.com"])
+    check_vals = {str(x).strip() for x in aliases if x}
+    if check_vals.intersection(LUNA_ALIASES):
+        aliases.extend(LUNA_ALIASES)
+    if check_vals.intersection(ADVISOR1_ALIASES):
+        aliases.extend(ADVISOR1_ALIASES)
     return list(dict.fromkeys([a for a in aliases if a]))
 
 def get_psychic_or_query(psychic_id: str, email: Optional[str] = None) -> List[dict]:
@@ -32,6 +49,60 @@ def get_psychic_or_query(psychic_id: str, email: Optional[str] = None) -> List[d
 
 def create_psychic_portal_routes(db):
     router = APIRouter(prefix="/psychic-portal", tags=["psychic-portal"])
+
+    async def resolve_psychic_and_aliases(psychic_id: str, email: Optional[str] = None):
+        """Find all linked psychic documents by id, email, or _id, and return (merged_psychic, all_aliases)."""
+        aliases = get_psychic_alias_ids(psychic_id, email)
+
+        def _build_or(alias_list: List[str]):
+            clauses = [{"id": {"$in": alias_list}}, {"email": {"$in": alias_list}}]
+            try:
+                from bson.objectid import ObjectId
+                obj_ids = [ObjectId(a) for a in alias_list if isinstance(a, str) and len(a) == 24 and ObjectId.is_valid(a)]
+                if obj_ids:
+                    clauses.append({"_id": {"$in": obj_ids}})
+            except Exception:
+                pass
+            return clauses
+
+        docs = await db.psychics.find({"$or": _build_or(aliases)}).to_list(20)
+        if docs:
+            for d in docs:
+                d_id = d.get("id") or (str(d.get("_id")) if d.get("_id") else None)
+                d_email = d.get("email")
+                aliases.extend(get_psychic_alias_ids(d_id or "", d_email))
+                if d.get("_id"):
+                    aliases.append(str(d.get("_id")))
+            aliases = list(dict.fromkeys([a for a in aliases if a]))
+            # Second pass in case newly discovered email/id links to another psychic doc (e.g. psy-001)
+            docs = await db.psychics.find({"$or": _build_or(aliases)}).to_list(20)
+            for d in docs:
+                d_id = d.get("id") or (str(d.get("_id")) if d.get("_id") else None)
+                d_email = d.get("email")
+                aliases.extend(get_psychic_alias_ids(d_id or "", d_email))
+                if d.get("_id"):
+                    aliases.append(str(d.get("_id")))
+            aliases = list(dict.fromkeys([a for a in aliases if a]))
+
+        psychic = None
+        if docs:
+            # Prefer a doc that has an explicit 'id' field and higher earnings
+            docs_sorted = sorted(
+                docs,
+                key=lambda x: (
+                    1 if x.get("id") else 0,
+                    float(x.get("total_earnings", 0) or 0),
+                    float(x.get("available_balance", 0) or 0),
+                ),
+                reverse=True,
+            )
+            psychic = dict(docs_sorted[0])
+            psychic["total_earnings"] = max(float(d.get("total_earnings", 0) or 0) for d in docs)
+            psychic["available_balance"] = max(float(d.get("available_balance", 0) or 0) for d in docs)
+            psychic["total_readings"] = max(int(d.get("total_readings", 0) or 0) for d in docs)
+            psychic["total_withdrawn"] = max(float(d.get("total_withdrawn", 0) or 0) for d in docs)
+
+        return psychic, aliases
     
     # ============ APPLICATION ============
     @router.post("/apply")
@@ -98,19 +169,9 @@ def create_psychic_portal_routes(db):
     
     # ============ DASHBOARD ============
     @router.get("/dashboard/{psychic_id}")
-    async def get_dashboard(psychic_id: str):
+    async def get_dashboard(psychic_id: str, email: Optional[str] = None):
         """Get psychic dashboard stats dynamically from database"""
-        aliases = get_psychic_alias_ids(psychic_id)
-        
-        # Find psychic by id, email, or _id
-        psychic = await db.psychics.find_one({"$or": [{"id": {"$in": aliases}}, {"email": {"$in": aliases}}]})
-        if not psychic:
-            try:
-                from bson.objectid import ObjectId
-                if len(psychic_id) == 24 and ObjectId.is_valid(psychic_id):
-                    psychic = await db.psychics.find_one({"_id": ObjectId(psychic_id)})
-            except Exception:
-                pass
+        psychic, aliases = await resolve_psychic_and_aliases(psychic_id, email)
 
         # If not in database, fallback to known mock psychics or auto-create so it NEVER 404s
         if not psychic:
@@ -119,6 +180,7 @@ def create_psychic_portal_routes(db):
                 for mp in MOCK_PSYCHICS:
                     if mp.get("id") in aliases or mp.get("email") in aliases:
                         psychic = dict(mp)
+                        aliases = get_psychic_alias_ids(psychic.get("id", psychic_id), psychic.get("email") or email)
                         break
             except Exception:
                 pass
@@ -127,7 +189,7 @@ def create_psychic_portal_routes(db):
                 psychic = {
                     "id": psychic_id,
                     "name": "Advisor",
-                    "email": psychic_id if "@" in psychic_id else "advisor@sixthsense.com",
+                    "email": email or (psychic_id if "@" in psychic_id else "advisor@sixthsense.com"),
                     "rating": 5.0,
                     "total_reviews": 0,
                     "total_readings": 0,
@@ -141,7 +203,7 @@ def create_psychic_portal_routes(db):
                 pass
 
         pid = psychic.get("id", psychic_id)
-        email = psychic.get("email")
+        email = psychic.get("email") or email
 
         # Ratings & Reviews (100% dynamic from db.reviews)
         rev_query_or = [
@@ -289,7 +351,7 @@ def create_psychic_portal_routes(db):
     @router.get("/session-breakdown/{psychic_id}")
     async def get_session_breakdown(psychic_id: str, email: Optional[str] = None):
         """Get 100% dynamic breakdown of client interactions: Chats, Audio Calls, Video Calls"""
-        aliases = get_psychic_alias_ids(psychic_id, email)
+        _, aliases = await resolve_psychic_and_aliases(psychic_id, email)
         query_or = [
             {"psychic_id": {"$in": aliases}},
             {"psychic_email": {"$in": aliases}},
@@ -372,7 +434,7 @@ def create_psychic_portal_routes(db):
     @router.get("/questions/{psychic_id}")
     async def get_psychic_questions(psychic_id: str, status: Optional[str] = None, email: Optional[str] = None):
         """Get readings/questions and completed sessions for psychic"""
-        aliases = get_psychic_alias_ids(psychic_id, email)
+        _, aliases = await resolve_psychic_and_aliases(psychic_id, email)
         query_or = [
             {"psychic_id": {"$in": aliases}},
             {"psychic_email": {"$in": aliases}}
@@ -588,12 +650,8 @@ def create_psychic_portal_routes(db):
         offers_standard_readings = status_data.get("offers_standard_readings")
         offers_emergency_readings = status_data.get("offers_emergency_readings")
 
-        # Find psychic by ID or email
-        psychic = None
-        if psychic_id:
-            psychic = await db.psychics.find_one({"id": psychic_id})
-        if not psychic and email:
-            psychic = await db.psychics.find_one({"email": email})
+        # Find psychic by ID or email or aliases
+        psychic, aliases = await resolve_psychic_and_aliases(psychic_id or "", email)
 
         # Determine effective service toggles
         if offers_chat is None and offers_phone is None and offers_video is None and online_status is not None:
@@ -632,17 +690,26 @@ def create_psychic_portal_routes(db):
         actual_name = psychic.get("name") if psychic else None
 
         if not psychic:
-            # Create/update psychic entry if it doesn't exist
-            filter_query = {"email": email} if email else {"id": psychic_id}
+            # Create/update psychic entry if it doesn't exist (always include explicit id!)
+            canonical_id = actual_id or ("64ea86f6-968a-4dfc-8c98-1a322fb020c0" if email in ("testpsychic@sixthsense.com", "luna@psychic.com") else f"psy-{uuid.uuid4().hex[:8]}")
+            filter_query = {"email": email} if email else {"id": canonical_id}
             await db.psychics.update_one(
                 filter_query,
-                {"$set": update_data},
+                {"$set": update_data, "$setOnInsert": {"id": canonical_id, "email": email}},
                 upsert=True
             )
         else:
-            # Update existing psychic
-            await db.psychics.update_one(
-                {"_id": psychic["_id"]},
+            # Update all linked psychic documents so aliases stay in sync
+            or_clauses = [{"id": {"$in": aliases}}, {"email": {"$in": aliases}}]
+            try:
+                from bson.objectid import ObjectId
+                obj_ids = [ObjectId(a) for a in aliases if isinstance(a, str) and len(a) == 24 and ObjectId.is_valid(a)]
+                if obj_ids:
+                    or_clauses.append({"_id": {"$in": obj_ids}})
+            except Exception:
+                pass
+            await db.psychics.update_many(
+                {"$or": or_clauses},
                 {"$set": update_data}
             )
 
@@ -722,8 +789,7 @@ def create_psychic_portal_routes(db):
             )
         
         # Check available balance
-        aliases = get_psychic_alias_ids(psychic_id)
-        psychic = await db.psychics.find_one({"$or": [{"id": {"$in": aliases}}, {"email": {"$in": aliases}}]})
+        psychic, aliases = await resolve_psychic_and_aliases(psychic_id)
         if not psychic:
             try:
                 from routes.psychics import MOCK_PSYCHICS
@@ -756,7 +822,7 @@ def create_psychic_portal_routes(db):
     @router.get("/withdrawals/{psychic_id}")
     async def get_withdrawals(psychic_id: str):
         """Get withdrawal history"""
-        aliases = get_psychic_alias_ids(psychic_id)
+        _, aliases = await resolve_psychic_and_aliases(psychic_id)
         withdrawals = await db.withdrawals.find({
             "$or": [{"psychic_id": {"$in": aliases}}, {"psychic_email": {"$in": aliases}}]
         }).sort("created_at", -1).to_list(50)

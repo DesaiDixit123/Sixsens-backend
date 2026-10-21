@@ -150,6 +150,13 @@ async def on_startup():
     import asyncio
     await init_db_indexes()
     await cleanup_stale_sessions()
+    try:
+        await db.psychics.update_many(
+            {"email": "testpsychic@sixthsense.com"},
+            {"$set": {"id": "64ea86f6-968a-4dfc-8c98-1a322fb020c0", "name": "Luna Starweaver"}}
+        )
+    except Exception as e:
+        print(f"⚠️ Psychic alias repair notice: {e}")
     asyncio.create_task(ensure_all_users_have_fcm_tokens())
 
 # Create a router with the /api prefix

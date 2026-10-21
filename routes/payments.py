@@ -1304,13 +1304,87 @@ def create_payment_routes(db):
             logger.error(f"Error saving bank details: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
+    LUNA_ALIASES = (
+        "64ea86f6-968a-4dfc-8c98-1a322fb020c0",
+        "psy-001",
+        "6ad8404c91aa72ec5152b40b",
+        "testpsychic@sixthsense.com",
+        "luna@psychic.com",
+    )
+
+    ADVISOR1_ALIASES = (
+        "psychic-001",
+        "6acb56c6c1e7433d353832a4",
+        "advisor@psychic.com",
+    )
+
+    def get_psychic_aliases(psychic_id: str, email: Optional[str] = None) -> List[str]:
+        aliases = [psychic_id]
+        if email:
+            aliases.append(email)
+        check_vals = {str(x).strip() for x in aliases if x}
+        if check_vals.intersection(LUNA_ALIASES):
+            aliases.extend(LUNA_ALIASES)
+        if check_vals.intersection(ADVISOR1_ALIASES):
+            aliases.extend(ADVISOR1_ALIASES)
+        return list(dict.fromkeys([a for a in aliases if a]))
+
+    async def resolve_psychic_and_aliases(psychic_id: str, email: Optional[str] = None):
+        aliases = get_psychic_aliases(psychic_id, email)
+
+        def _build_or(alias_list: List[str]):
+            clauses = [{"id": {"$in": alias_list}}, {"email": {"$in": alias_list}}]
+            try:
+                from bson.objectid import ObjectId
+                obj_ids = [ObjectId(a) for a in alias_list if isinstance(a, str) and len(a) == 24 and ObjectId.is_valid(a)]
+                if obj_ids:
+                    clauses.append({"_id": {"$in": obj_ids}})
+            except Exception:
+                pass
+            return clauses
+
+        docs = await db.psychics.find({"$or": _build_or(aliases)}).to_list(20)
+        if docs:
+            for d in docs:
+                d_id = d.get("id") or (str(d.get("_id")) if d.get("_id") else None)
+                d_email = d.get("email")
+                aliases.extend(get_psychic_aliases(d_id or "", d_email))
+                if d.get("_id"):
+                    aliases.append(str(d.get("_id")))
+            aliases = list(dict.fromkeys([a for a in aliases if a]))
+            docs = await db.psychics.find({"$or": _build_or(aliases)}).to_list(20)
+            for d in docs:
+                d_id = d.get("id") or (str(d.get("_id")) if d.get("_id") else None)
+                d_email = d.get("email")
+                aliases.extend(get_psychic_aliases(d_id or "", d_email))
+                if d.get("_id"):
+                    aliases.append(str(d.get("_id")))
+            aliases = list(dict.fromkeys([a for a in aliases if a]))
+
+        psychic = None
+        if docs:
+            docs_sorted = sorted(
+                docs,
+                key=lambda x: (
+                    1 if x.get("id") else 0,
+                    float(x.get("total_earnings", 0) or 0),
+                    float(x.get("available_balance", 0) or 0),
+                ),
+                reverse=True,
+            )
+            psychic = dict(docs_sorted[0])
+            psychic["total_earnings"] = max(float(d.get("total_earnings", 0) or 0) for d in docs)
+            psychic["available_balance"] = max(float(d.get("available_balance", 0) or 0) for d in docs)
+            psychic["total_readings"] = max(int(d.get("total_readings", 0) or 0) for d in docs)
+            psychic["total_withdrawn"] = max(float(d.get("total_withdrawn", 0) or 0) for d in docs)
+            psychic["total_tips"] = max(float(d.get("total_tips", 0) or 0) for d in docs)
+
+        return psychic, aliases
+
     @router.post("/payout-request")
     async def request_payout(request: PayoutRequest):
         """Psychic requests a payout of their earnings"""
-        aliases = get_psychic_aliases(request.psychic_id)
-        psychic = await db.psychics.find_one({
-            "$or": [{"id": {"$in": aliases}}, {"email": {"$in": aliases}}, {"_id": request.psychic_id}]
-        })
+        psychic, aliases = await resolve_psychic_and_aliases(request.psychic_id)
         if not psychic:
             try:
                 from routes.psychics import MOCK_PSYCHICS
@@ -1394,16 +1468,10 @@ def create_payment_routes(db):
             "estimated_arrival": "3-5 business days"
         }
 
-    def get_psychic_aliases(psychic_id: str) -> List[str]:
-        aliases = [psychic_id]
-        if psychic_id in ("64ea86f6-968a-4dfc-8c98-1a322fb020c0", "psy-001", "testpsychic@sixthsense.com", "luna@psychic.com"):
-            aliases.extend(["64ea86f6-968a-4dfc-8c98-1a322fb020c0", "psy-001", "testpsychic@sixthsense.com", "luna@psychic.com"])
-        return list(dict.fromkeys([a for a in aliases if a]))
-
     @router.get("/psychic-payouts/{psychic_id}")
-    async def get_psychic_payouts(psychic_id: str):
+    async def get_psychic_payouts(psychic_id: str, email: Optional[str] = None):
         """Get all payout/withdrawal requests for a specific psychic (ADV-045)"""
-        aliases = get_psychic_aliases(psychic_id)
+        _, aliases = await resolve_psychic_and_aliases(psychic_id, email)
         payouts = await db.payouts.find({
             "$or": [{"psychic_id": {"$in": aliases}}, {"psychic_email": {"$in": aliases}}]
         }).sort("created_at", -1).to_list(100)
@@ -1489,17 +1557,9 @@ def create_payment_routes(db):
             return f"Transaction: ${amount}"
     
     @router.get("/psychic-earnings/{psychic_id}")
-    async def get_psychic_earnings(psychic_id: str, timeframe: str = "all"):
+    async def get_psychic_earnings(psychic_id: str, timeframe: str = "all", email: Optional[str] = None):
         """Get psychic's earnings summary + real recent transactions from ended sessions"""
-        aliases = get_psychic_aliases(psychic_id)
-        psychic = await db.psychics.find_one({"$or": [{"id": {"$in": aliases}}, {"email": {"$in": aliases}}]})
-        if not psychic:
-            try:
-                from bson.objectid import ObjectId
-                if len(psychic_id) == 24 and ObjectId.is_valid(psychic_id):
-                    psychic = await db.psychics.find_one({"_id": ObjectId(psychic_id)})
-            except Exception:
-                pass
+        psychic, aliases = await resolve_psychic_and_aliases(psychic_id, email)
         if not psychic:
             # Fallback to in-memory MOCK_PSYCHICS or create dummy so it never 404s
             try:
@@ -1507,14 +1567,15 @@ def create_payment_routes(db):
                 for mp in MOCK_PSYCHICS:
                     if mp.get("id") in aliases or mp.get("email") in aliases:
                         psychic = dict(mp)
+                        aliases = get_psychic_aliases(psychic.get("id", psychic_id), psychic.get("email") or email)
                         break
             except Exception:
                 pass
             if not psychic:
-                psychic = {"id": psychic_id, "email": psychic_id if "@" in psychic_id else "advisor@sixthsense.com", "total_earnings": 0.0, "available_balance": 0.0}
+                psychic = {"id": psychic_id, "email": email or (psychic_id if "@" in psychic_id else "advisor@sixthsense.com"), "total_earnings": 0.0, "available_balance": 0.0}
 
         pid = psychic.get("id", psychic_id)
-        pemail = psychic.get("email")
+        pemail = psychic.get("email") or email
 
         # Timeframe filter for period stats + transactions
         now = datetime.utcnow()
@@ -1633,7 +1694,8 @@ def create_payment_routes(db):
         # Sort combined transactions by date descending
         transactions.sort(key=lambda x: str(x.get("date", "")), reverse=True)
 
-        total_tips_all = round(float(psychic.get("total_tips", 0) or total_tips_period), 2)
+        computed_tips_all = round(sum(float(t.get("amount", 0) or 0) for t in all_tips_lifetime), 2)
+        total_tips_all = max(round(float(psychic.get("total_tips", 0) or 0), 2), computed_tips_all, total_tips_period)
 
         period_reading_net = period_net
         period_tips = total_tips_period
@@ -1645,7 +1707,7 @@ def create_payment_routes(db):
             "pending_balance": round(float(psychic.get("pending_balance", 0) or 0), 2),
             "total_earnings": total_earnings,
             "total_tips": total_tips_all,
-            "total_readings": psychic.get("total_readings", 0),
+            "total_readings": max(int(psychic.get("total_readings", 0) or 0), len(all_sessions)),
             "timeframe": timeframe,
             "period_gross": period_gross,
             "period_net": period_total_net,
@@ -1941,25 +2003,27 @@ def create_payment_routes(db):
 
     # ============ PDF EARNINGS STATEMENT ============
     @router.get("/statement-pdf/{psychic_id}", response_class=HTMLResponse)
-    async def get_earnings_statement_pdf(psychic_id: str, timeframe: str = "month"):
+    async def get_earnings_statement_pdf(psychic_id: str, timeframe: str = "month", email: Optional[str] = None):
         """Generate a print-ready HTML/PDF earnings statement for advisor"""
-        aliases = get_psychic_aliases(psychic_id)
-        psychic = await db.psychics.find_one({"$or": [{"id": {"$in": aliases}}, {"email": {"$in": aliases}}]})
+        psychic, aliases = await resolve_psychic_and_aliases(psychic_id, email)
         if not psychic:
             try:
                 from routes.psychics import MOCK_PSYCHICS
                 for mp in MOCK_PSYCHICS:
                     if mp.get("id") in aliases or mp.get("email") in aliases:
                         psychic = dict(mp)
+                        aliases = get_psychic_aliases(psychic.get("id", psychic_id), psychic.get("email") or email)
                         break
             except Exception:
                 pass
         if not psychic:
-            psychic = {"id": psychic_id, "name": "Advisor", "email": psychic_id if "@" in psychic_id else "advisor@sixthsense.com"}
+            psychic = {"id": psychic_id, "name": "Advisor", "email": email or (psychic_id if "@" in psychic_id else "advisor@sixthsense.com")}
 
         pid = psychic.get("id", psychic_id)
-        pemail = psychic.get("email", "")
+        pemail = psychic.get("email") or email or ""
         name = psychic.get("name") or "Advisor"
+        if name == "Advisor" and ("psy-001" in aliases or "testpsychic@sixthsense.com" in aliases):
+            name = "Luna Starweaver"
 
         now = datetime.utcnow()
         since = None
