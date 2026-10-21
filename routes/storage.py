@@ -278,7 +278,18 @@ def create_storage_routes(db):
 
         # Attempt upload to Cloudinary for permanent CDN URL
         try:
+            import cloudinary
             import cloudinary.uploader
+            cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME")
+            api_key = os.getenv("CLOUDINARY_API_KEY")
+            api_secret = os.getenv("CLOUDINARY_API_SECRET")
+            if cloud_name and api_key and api_secret:
+                cloudinary.config(
+                    cloud_name=cloud_name,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    secure=True
+                )
             res = cloudinary.uploader.upload(
                 f"data:{ctype};base64,{b64}",
                 folder="profiles",
@@ -323,7 +334,7 @@ def create_storage_routes(db):
         
         await db.files.insert_one(file_doc)
         
-        base_url = os.getenv("BACKEND_URL", "http://192.168.29.73:8000")
+        base_url = os.getenv("BACKEND_URL", "https://api.sixthsensepsychics.com").rstrip("/")
         file_url = f"{base_url}/api/storage/file/{file_id}"
         
         return {

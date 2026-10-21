@@ -54,16 +54,19 @@ class PsychicListResponse(BaseModel):
     id: str
     name: str
     profile_picture: str
+    profile_image: Optional[str] = None
     description: str
     specialties: List[str]
     topics: List[str]
     reading_methods: List[str]
     chat_rate: float
+    price_per_minute: Optional[float] = None
     phone_rate: float = 4.99
     video_rate: float = 6.99
     video_call_rate: float = 6.99
     online_status: str
     average_rating: float
+    rating: Optional[float] = None
     total_reviews: int
     total_readings: int
     is_featured: bool
@@ -79,4 +82,17 @@ class PsychicListResponse(BaseModel):
     intro_video_url: Optional[str] = None
     intro_video_duration: Optional[int] = None
     interview_answers: Optional[List[dict]] = None
+
+    def __init__(self, **data):
+        if not data.get("profile_image") and data.get("profile_picture"):
+            data["profile_image"] = data["profile_picture"]
+        if data.get("price_per_minute") is None and data.get("chat_rate") is not None:
+            data["price_per_minute"] = data["chat_rate"]
+        avg_r = data.get("average_rating")
+        if not avg_r or float(avg_r) <= 0:
+            data["average_rating"] = 5.0
+        if data.get("rating") is None:
+            data["rating"] = data.get("average_rating", 5.0)
+        super().__init__(**data)
+
 
