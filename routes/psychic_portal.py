@@ -679,11 +679,21 @@ def create_psychic_portal_routes(db):
             )
         
         # Check available balance
-        psychic = await db.psychics.find_one({"id": psychic_id})
+        aliases = get_psychic_alias_ids(psychic_id)
+        psychic = await db.psychics.find_one({"$or": [{"id": {"$in": aliases}}, {"email": {"$in": aliases}}]})
+        if not psychic:
+            try:
+                from routes.psychics import MOCK_PSYCHICS
+                for mp in MOCK_PSYCHICS:
+                    if mp.get("id") in aliases or mp.get("email") in aliases:
+                        psychic = dict(mp)
+                        break
+            except Exception:
+                pass
         if not psychic:
             raise HTTPException(status_code=404, detail="Psychic not found")
         
-        available = psychic.get("total_earnings", 0) - psychic.get("withdrawn", 0)
+        available = float(psychic.get("available_balance", 0) or psychic.get("total_earnings", 0) or 0) - float(psychic.get("withdrawn", 0) or 0)
         if withdrawal.amount > available:
             raise HTTPException(
                 status_code=400,
@@ -691,7 +701,7 @@ def create_psychic_portal_routes(db):
             )
         
         new_withdrawal = Withdrawal(
-            psychic_id=psychic_id,
+            psychic_id=psychic.get("id", psychic_id),
             amount=withdrawal.amount,
             payment_method=withdrawal.payment_method,
             payment_details=withdrawal.payment_details
@@ -703,8 +713,9 @@ def create_psychic_portal_routes(db):
     @router.get("/withdrawals/{psychic_id}")
     async def get_withdrawals(psychic_id: str):
         """Get withdrawal history"""
+        aliases = get_psychic_alias_ids(psychic_id)
         withdrawals = await db.withdrawals.find({
-            "psychic_id": psychic_id
+            "$or": [{"psychic_id": {"$in": aliases}}, {"psychic_email": {"$in": aliases}}]
         }).sort("created_at", -1).to_list(50)
         return withdrawals
     

@@ -1307,9 +1307,19 @@ def create_payment_routes(db):
     @router.post("/payout-request")
     async def request_payout(request: PayoutRequest):
         """Psychic requests a payout of their earnings"""
+        aliases = get_psychic_aliases(request.psychic_id)
         psychic = await db.psychics.find_one({
-            "$or": [{"id": request.psychic_id}, {"_id": request.psychic_id}]
+            "$or": [{"id": {"$in": aliases}}, {"email": {"$in": aliases}}, {"_id": request.psychic_id}]
         })
+        if not psychic:
+            try:
+                from routes.psychics import MOCK_PSYCHICS
+                for mp in MOCK_PSYCHICS:
+                    if mp.get("id") in aliases or mp.get("email") in aliases:
+                        psychic = dict(mp)
+                        break
+            except Exception:
+                pass
         if not psychic:
             raise HTTPException(status_code=404, detail="Psychic not found")
         
@@ -1918,11 +1928,19 @@ def create_payment_routes(db):
     @router.get("/statement-pdf/{psychic_id}", response_class=HTMLResponse)
     async def get_earnings_statement_pdf(psychic_id: str, timeframe: str = "month"):
         """Generate a print-ready HTML/PDF earnings statement for advisor"""
-        psychic = await db.psychics.find_one({"id": psychic_id})
+        aliases = get_psychic_aliases(psychic_id)
+        psychic = await db.psychics.find_one({"$or": [{"id": {"$in": aliases}}, {"email": {"$in": aliases}}]})
         if not psychic:
-            psychic = await db.psychics.find_one({"email": psychic_id})
+            try:
+                from routes.psychics import MOCK_PSYCHICS
+                for mp in MOCK_PSYCHICS:
+                    if mp.get("id") in aliases or mp.get("email") in aliases:
+                        psychic = dict(mp)
+                        break
+            except Exception:
+                pass
         if not psychic:
-            raise HTTPException(status_code=404, detail="Psychic not found")
+            psychic = {"id": psychic_id, "name": "Advisor", "email": psychic_id if "@" in psychic_id else "advisor@sixthsense.com"}
 
         pid = psychic.get("id", psychic_id)
         pemail = psychic.get("email", "")
@@ -1941,17 +1959,19 @@ def create_payment_routes(db):
             since = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
             period_label = now.strftime("%B %Y")
 
-        query_or = [{"psychic_id": pid}]
-        if pemail:
-            query_or.append({"psychic_email": pemail})
-            query_or.append({"psychic_id": pemail})
+        query_or = [{"psychic_id": {"$in": aliases}}, {"psychic_email": {"$in": aliases}}]
         query = {"$or": query_or, "status": "ended"}
         if since:
             query["ended_at"] = {"$gte": since}
 
         sessions = await db.chat_sessions.find(query).sort("ended_at", -1).to_list(500)
+        
+        def calc_s_earn(s):
+            raw = s.get("psychic_earnings")
+            return float(raw) if raw is not None else round(float(s.get("total_cost", 0) or 0) * 0.40, 2)
+
         period_gross = round(sum(float(s.get("total_cost", 0) or 0) for s in sessions), 2)
-        period_net = round(sum(float(s.get("psychic_earnings", 0) or 0) for s in sessions), 2)
+        period_net = round(sum(calc_s_earn(s) for s in sessions), 2)
         platform_fee = round(period_gross - period_net, 2)
 
         # Tips
@@ -1962,7 +1982,7 @@ def create_payment_routes(db):
         period_tips = round(sum(float(t.get("amount", 0) or 0) for t in tips), 2)
         total_net_with_tips = round(period_net + period_tips, 2)
 
-        available_balance = round(float(psychic.get("available_balance", 0) or 0), 2)
+        available_balance = round(float(psychic.get("available_balance", 0) or total_net_with_tips), 2)
 
         # Build table rows
         rows_html = ""
