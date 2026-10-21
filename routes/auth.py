@@ -433,10 +433,10 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
                 "phone_rate": 5.99,
                 "video_rate": 7.99,
                 "online_status": "online",
-                "total_earnings": 14250.00,
-                "average_rating": 4.9,
-                "total_reviews": 342,
-                "total_readings": 1256,
+                "total_earnings": 0.0,
+                "average_rating": 5.0,
+                "total_reviews": 0,
+                "total_readings": 0,
                 "status": "approved"
             },
             "luna@psychic.com": {
@@ -451,10 +451,10 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
                 "phone_rate": 5.99,
                 "video_rate": 7.99,
                 "online_status": "online",
-                "total_earnings": 14250.00,
-                "average_rating": 4.9,
-                "total_reviews": 342,
-                "total_readings": 1256,
+                "total_earnings": 0.0,
+                "average_rating": 5.0,
+                "total_reviews": 0,
+                "total_readings": 0,
                 "status": "approved"
             },
             "advisor@psychic.com": {
@@ -562,6 +562,31 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
                 "total_readings": db_psychic.get("total_readings", 0),
                 "status": status
             }
+
+            # Enrich with real dynamic reviews & earnings from database
+            alias_list = [psychic_id, db_psychic.get("email"), email_lower]
+            if email_lower in ("testpsychic@sixthsense.com", "luna@psychic.com") or psychic_id in ("64ea86f6-968a-4dfc-8c98-1a322fb020c0", "psy-001"):
+                alias_list.extend(["psy-001", "64ea86f6-968a-4dfc-8c98-1a322fb020c0", "testpsychic@sixthsense.com"])
+            alias_list = list(dict.fromkeys([a for a in alias_list if a]))
+            try:
+                rev_docs = await db.reviews.find({"$or": [{"psychic_id": {"$in": alias_list}}, {"psychic_email": {"$in": alias_list}}]}).to_list(500)
+                if rev_docs:
+                    psychic_data["total_reviews"] = len(rev_docs)
+                    psychic_data["average_rating"] = round(sum(float(r.get("rating", 5) or 5) for r in rev_docs) / len(rev_docs), 1)
+                else:
+                    psychic_data["total_reviews"] = 0
+                    psychic_data["average_rating"] = 5.0
+            except Exception:
+                pass
+            try:
+                s_docs = await db.chat_sessions.find({"$or": [{"psychic_id": {"$in": alias_list}}, {"psychic_email": {"$in": alias_list}}], "status": "ended"}).to_list(2000)
+                psychic_data["total_readings"] = len(s_docs)
+                computed_earn = sum(float(s.get("psychic_earnings") if s.get("psychic_earnings") is not None else round(float(s.get("total_cost", 0) or 0) * 0.40, 2)) for s in s_docs)
+                psychic_data["total_earnings"] = round(computed_earn, 2)
+                psychic_data["available_balance"] = round(computed_earn, 2)
+            except Exception:
+                pass
+
             token = create_access_token({"user_id": psychic_id, "email": email_lower, "role": "psychic"})
             return {
                 "success": True,
@@ -576,6 +601,31 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
             raise HTTPException(status_code=401, detail="Invalid email or password")
         
         psychic_data = {k: v for k, v in psychic.items() if k != "password"}
+        
+        # Enrich mock account with real dynamic reviews & earnings from database
+        alias_list = [psychic_data.get("id"), psychic_data.get("email"), email_lower]
+        if email_lower in ("testpsychic@sixthsense.com", "luna@psychic.com") or psychic_data.get("id") in ("64ea86f6-968a-4dfc-8c98-1a322fb020c0", "psy-001"):
+            alias_list.extend(["psy-001", "64ea86f6-968a-4dfc-8c98-1a322fb020c0", "testpsychic@sixthsense.com"])
+        alias_list = list(dict.fromkeys([a for a in alias_list if a]))
+        try:
+            rev_docs = await db.reviews.find({"$or": [{"psychic_id": {"$in": alias_list}}, {"psychic_email": {"$in": alias_list}}]}).to_list(500)
+            if rev_docs:
+                psychic_data["total_reviews"] = len(rev_docs)
+                psychic_data["average_rating"] = round(sum(float(r.get("rating", 5) or 5) for r in rev_docs) / len(rev_docs), 1)
+            else:
+                psychic_data["total_reviews"] = 0
+                psychic_data["average_rating"] = 5.0
+        except Exception:
+            pass
+        try:
+            s_docs = await db.chat_sessions.find({"$or": [{"psychic_id": {"$in": alias_list}}, {"psychic_email": {"$in": alias_list}}], "status": "ended"}).to_list(2000)
+            psychic_data["total_readings"] = len(s_docs)
+            computed_earn = sum(float(s.get("psychic_earnings") if s.get("psychic_earnings") is not None else round(float(s.get("total_cost", 0) or 0) * 0.40, 2)) for s in s_docs)
+            psychic_data["total_earnings"] = round(computed_earn, 2)
+            psychic_data["available_balance"] = round(computed_earn, 2)
+        except Exception:
+            pass
+
         token = create_access_token({"user_id": psychic_data["id"], "email": email_lower, "role": "psychic"})
         return {
             "success": True,

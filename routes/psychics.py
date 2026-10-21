@@ -32,9 +32,9 @@ MOCK_PSYCHICS = [
         "video_rate": 7.99,
         "video_call_rate": 7.99,
         "online_status": "online",
-        "average_rating": 4.9,
-        "total_reviews": 342,
-        "total_readings": 1256,
+        "average_rating": 5.0,
+        "total_reviews": 0,
+        "total_readings": 0,
         "is_featured": True,
         "is_new": False,
         "is_first_hired": True,  # Founding Advisor #1
@@ -965,6 +965,20 @@ def create_psychic_routes(db: AsyncIOMotorDatabase):
                 resp_dict["id"] = psychic_id
                 resp_dict["video_rate"] = resp_dict.get("video_rate") or resp_dict.get("video_call_rate") or 7.99
                 resp_dict["video_call_rate"] = resp_dict["video_rate"]
+
+                # Enrich with dynamic reviews
+                alias_list = [psychic_id, "psy-001", "64ea86f6-968a-4dfc-8c98-1a322fb020c0"] if psychic_id in ("psy-001", "64ea86f6-968a-4dfc-8c98-1a322fb020c0") else [psychic_id]
+                try:
+                    rev_docs = await db.reviews.find({"$or": [{"psychic_id": {"$in": alias_list}}, {"psychic_email": {"$in": alias_list}}]}).to_list(500)
+                    if rev_docs:
+                        resp_dict["total_reviews"] = len(rev_docs)
+                        resp_dict["average_rating"] = round(sum(float(r.get("rating", 5) or 5) for r in rev_docs) / len(rev_docs), 1)
+                    else:
+                        resp_dict["total_reviews"] = 0
+                        resp_dict["average_rating"] = 5.0
+                except Exception:
+                    pass
+
                 return PsychicListResponse(**resp_dict)
         
         if db_psychic:
