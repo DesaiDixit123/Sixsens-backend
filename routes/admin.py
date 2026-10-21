@@ -840,6 +840,7 @@ def create_admin_routes(db):
     @router.get("/applications")
     async def get_applications(status: str = "pending"):
         """Get psychic applications from all possible collections"""
+        from routes.applications import normalize_applicant_video_url
         try:
             query = {}
             if status and status != "all":
@@ -862,6 +863,9 @@ def create_admin_routes(db):
                     app_data['_id'] = str(app_data['_id'])
                 if 'full_name' in app_data and 'name' not in app_data:
                     app_data['name'] = app_data['full_name']
+                norm_vid = normalize_applicant_video_url(app_data.get("video_url") or app_data.get("intro_video_url"))
+                app_data["video_url"] = norm_vid
+                app_data["intro_video_url"] = norm_vid
                 result.append(app_data)
             
             # Also try 'psychic_applications' collection
@@ -874,6 +878,9 @@ def create_admin_routes(db):
                     app_data['_id'] = str(app_data['_id'])
                 if 'full_name' in app_data and 'name' not in app_data:
                     app_data['name'] = app_data['full_name']
+                norm_vid = normalize_applicant_video_url(app_data.get("video_url") or app_data.get("intro_video_url"))
+                app_data["video_url"] = norm_vid
+                app_data["intro_video_url"] = norm_vid
                 if not any(r.get('id') == app_data.get('id') or r.get('email') == app_data.get('email') for r in result):
                     result.append(app_data)
             
@@ -890,6 +897,7 @@ def create_admin_routes(db):
     @router.get("/applications/{app_id}")
     async def get_application_by_id(app_id: str):
         """Get single application details by ID"""
+        from routes.applications import normalize_applicant_video_url
         app = await db.applications.find_one({"id": app_id})
         if not app:
             try:
@@ -901,8 +909,12 @@ def create_admin_routes(db):
             app = await db.psychic_applications.find_one({"id": app_id})
         if not app:
             raise HTTPException(status_code=404, detail="Application not found")
+        app = dict(app)
         if "_id" in app:
             app["_id"] = str(app["_id"])
+        norm_vid = normalize_applicant_video_url(app.get("video_url") or app.get("intro_video_url"))
+        app["video_url"] = norm_vid
+        app["intro_video_url"] = norm_vid
         return app
     
     @router.post("/applications/{app_id}/approve")

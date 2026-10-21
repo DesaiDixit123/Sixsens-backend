@@ -155,6 +155,16 @@ async def on_startup():
             {"email": "testpsychic@sixthsense.com"},
             {"$set": {"id": "64ea86f6-968a-4dfc-8c98-1a322fb020c0", "name": "Luna Starweaver"}}
         )
+        default_cloud_vid = "https://res.cloudinary.com/dil1lmb1u/video/upload/v1792562344/advisor_videos/f8de89ce-86ba-4ab6-81e1-f44ca73f75be.mp4"
+        await db.applications.update_many(
+            {
+                "$or": [
+                    {"video_url": {"$regex": "f8de89ce-86ba-4ab6-81e1-f44ca73f75be|^file://|^content://"}},
+                    {"video_url": {"$in": [None, "", "intro_video_recorded", "video_recorded_locally", "test_mode_video", "test_mode_intro_video"]}},
+                ]
+            },
+            {"$set": {"video_url": default_cloud_vid, "intro_video_url": default_cloud_vid}}
+        )
     except Exception as e:
         print(f"⚠️ Psychic alias repair notice: {e}")
     asyncio.create_task(ensure_all_users_have_fcm_tokens())

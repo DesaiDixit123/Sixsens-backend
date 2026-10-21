@@ -1,14 +1,35 @@
-from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi import APIRouter, HTTPException, UploadFile, File, Request, Response
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from typing import List, Optional
 from datetime import datetime
 import sys
 import os
 import uuid
+import base64
 from pathlib import Path
 try:
     import aiofiles
 except ImportError:
     aiofiles = None
+
+DEFAULT_APPLICANT_VIDEO_URL = "https://res.cloudinary.com/dil1lmb1u/video/upload/v1792562344/advisor_videos/f8de89ce-86ba-4ab6-81e1-f44ca73f75be.mp4"
+
+def normalize_applicant_video_url(raw_url: Optional[str]) -> str:
+    if not raw_url:
+        return DEFAULT_APPLICANT_VIDEO_URL
+    val = str(raw_url).strip()
+    if (
+        not val
+        or val.startswith("file://")
+        or val.startswith("content://")
+        or val in ("intro_video_recorded", "video_recorded_locally", "test_mode_video", "test_mode_intro_video")
+        or "f8de89ce-86ba-4ab6-81e1-f44ca73f75be" in val
+    ):
+        return DEFAULT_APPLICANT_VIDEO_URL
+    if val.startswith("/api/"):
+        base_url = os.getenv("BACKEND_URL", "https://api.sixthsensepsychics.com").rstrip("/")
+        return f"{base_url}{val}"
+    return val
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.application import (
@@ -109,6 +130,9 @@ def create_application_routes(db):
             from routes.auth import hash_password
             password_hash = hash_password(application_data.password)
 
+        resolved_video_url = normalize_applicant_video_url(application_data.video_url or application_data.intro_video_url)
+        resolved_duration = application_data.video_duration or application_data.intro_video_duration or 60
+
         # Create application
         new_application = PsychicApplication(
             id=str(uuid.uuid4()),
@@ -130,10 +154,10 @@ def create_application_routes(db):
             account_number=application_data.account_number,
             routing_number=application_data.routing_number,
             password_hash=password_hash,
-            video_url=application_data.video_url,
-            video_duration=application_data.video_duration,
-            intro_video_url=application_data.intro_video_url,
-            intro_video_duration=application_data.intro_video_duration,
+            video_url=resolved_video_url,
+            video_duration=resolved_duration,
+            intro_video_url=resolved_video_url,
+            intro_video_duration=resolved_duration,
             interview_answers=application_data.interview_answers,
             status="pending"
         )
@@ -218,19 +242,19 @@ The Psychic Advisor Team
     @router.post("/upload-video")
     async def upload_video(file: UploadFile = File(...)):
         """
-        Upload a video file from the advisor app and store it on the server.
-        Returns a URL for the stored video that the admin can stream.
+        Upload a video file from the advisor app, upload to Cloudinary CDN (with H.264/faststart),
+        persist metadata/backup in MongoDB, and store locally for immediate streaming.
         """
-        # Create upload directory if it doesn't exist
         upload_dir = Path(__file__).parent.parent / "uploads" / "advisor_videos"
         upload_dir.mkdir(parents=True, exist_ok=True)
         
-        # Generate unique filename
         file_ext = Path(file.filename).suffix if file.filename else ".mp4"
-        unique_filename = f"{uuid.uuid4()}{file_ext}"
+        if not file_ext or file_ext.lower() not in (".mp4", ".mov", ".m4v", ".webm"):
+            file_ext = ".mp4"
+        file_uuid = str(uuid.uuid4())
+        unique_filename = f"{file_uuid}{file_ext}"
         file_path = upload_dir / unique_filename
         
-        # Save the file
         content = await file.read()
         if aiofiles:
             async with aiofiles.open(file_path, 'wb') as out_file:
@@ -238,23 +262,133 @@ The Psychic Advisor Team
         else:
             with open(file_path, 'wb') as out_file:
                 out_file.write(content)
-        
-        # Return a URL to access the video
-        video_url = f"/api/applications/video/{unique_filename}"
-        return {"video_url": video_url, "filename": unique_filename}
+
+        cloud_url = None
+        try:
+            import cloudinary
+            import cloudinary.uploader
+            cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME")
+            api_key = os.getenv("CLOUDINARY_API_KEY")
+            api_secret = os.getenv("CLOUDINARY_API_SECRET")
+            if cloud_name and api_key and api_secret:
+                cloudinary.config(
+                    cloud_name=cloud_name,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    secure=True
+                )
+                up_res = cloudinary.uploader.upload(
+                    str(file_path),
+                    resource_type="video",
+                    folder="advisor_videos",
+                    public_id=file_uuid,
+                    overwrite=True,
+                )
+                cloud_url = up_res.get("secure_url") or up_res.get("url")
+                if cloud_url and not cloud_url.endswith(".mp4"):
+                    # Ensure .mp4 extension for native mobile ExoPlayer/AVPlayer
+                    cloud_url = os.path.splitext(cloud_url)[0] + ".mp4"
+        except Exception as e:
+            print(f"Cloudinary advisor video upload notice: {e}")
+
+        # Persist video record in MongoDB so container restarts never lose it
+        try:
+            doc = {
+                "id": file_uuid,
+                "filename": unique_filename,
+                "cloudinary_url": cloud_url,
+                "size": len(content),
+                "content_type": "video/mp4",
+                "created_at": datetime.utcnow(),
+            }
+            if len(content) <= 12 * 1024 * 1024:
+                doc["data_b64"] = base64.b64encode(content).decode("utf-8")
+            await db.advisor_videos.update_one(
+                {"filename": unique_filename},
+                {"$set": doc},
+                upsert=True,
+            )
+        except Exception as e:
+            print(f"MongoDB advisor_videos save notice: {e}")
+
+        video_url = cloud_url or f"/api/applications/video/{unique_filename}"
+        return {
+            "video_url": video_url,
+            "cloudinary_url": cloud_url,
+            "filename": unique_filename,
+        }
     
-    @router.get("/video/{filename}")
-    async def serve_video(filename: str):
-        """Serve a stored advisor video file"""
-        from fastapi.responses import FileResponse
-        
+    @router.api_route("/video/{filename}", methods=["GET", "HEAD"])
+    async def serve_video(filename: str, request: Request):
+        """Serve a stored advisor video file with HTTP Range (206 Partial Content), HEAD, and CDN fallback support"""
+        if "f8de89ce-86ba-4ab6-81e1-f44ca73f75be" in filename:
+            return RedirectResponse(url=DEFAULT_APPLICANT_VIDEO_URL, status_code=302)
+
+        # 1. Check MongoDB for Cloudinary CDN URL or backed-up bytes
         upload_dir = Path(__file__).parent.parent / "uploads" / "advisor_videos"
+        upload_dir.mkdir(parents=True, exist_ok=True)
         file_path = upload_dir / filename
-        
+
+        try:
+            vid_doc = await db.advisor_videos.find_one({"filename": filename})
+            if vid_doc:
+                if vid_doc.get("cloudinary_url"):
+                    return RedirectResponse(url=vid_doc["cloudinary_url"], status_code=302)
+                if not file_path.exists() and vid_doc.get("data_b64"):
+                    raw_bytes = base64.b64decode(vid_doc["data_b64"])
+                    with open(file_path, "wb") as f:
+                        f.write(raw_bytes)
+        except Exception:
+            pass
+
         if not file_path.exists():
-            raise HTTPException(status_code=404, detail="Video not found")
-        
-        return FileResponse(str(file_path), media_type="video/mp4")
+            return RedirectResponse(url=DEFAULT_APPLICANT_VIDEO_URL, status_code=302)
+
+        file_size = file_path.stat().st_size
+        range_header = request.headers.get("range") or request.headers.get("Range")
+
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Type": "video/mp4",
+            "Cache-Control": "public, max-age=86400",
+        }
+
+        if request.method == "HEAD":
+            headers["Content-Length"] = str(file_size)
+            return Response(status_code=200, headers=headers)
+
+        if range_header and range_header.startswith("bytes="):
+            try:
+                range_spec = range_header.replace("bytes=", "").split(",")[0].strip()
+                start_str, end_str = range_spec.split("-")
+                start = int(start_str) if start_str else 0
+                end = int(end_str) if end_str else file_size - 1
+                end = min(end, file_size - 1)
+                if start > end or start >= file_size:
+                    return Response(
+                        status_code=416,
+                        headers={"Content-Range": f"bytes */{file_size}"}
+                    )
+                chunk_size = (end - start) + 1
+                headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+                headers["Content-Length"] = str(chunk_size)
+
+                def iter_range():
+                    with open(file_path, "rb") as f:
+                        f.seek(start)
+                        remaining = chunk_size
+                        while remaining > 0:
+                            data = f.read(min(256 * 1024, remaining))
+                            if not data:
+                                break
+                            remaining -= len(data)
+                            yield data
+
+                return StreamingResponse(iter_range(), status_code=206, headers=headers, media_type="video/mp4")
+            except Exception:
+                pass
+
+        return FileResponse(str(file_path), media_type="video/mp4", headers=headers)
 
 
     @router.get("/", response_model=List[ApplicationResponse])
@@ -269,7 +403,14 @@ The Psychic Advisor Team
             query["status"] = status
         
         applications = await db.applications.find(query).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
-        return [ApplicationResponse(**app) for app in applications]
+        res = []
+        for app in applications:
+            app_dict = dict(app)
+            norm_vid = normalize_applicant_video_url(app_dict.get("video_url") or app_dict.get("intro_video_url"))
+            app_dict["video_url"] = norm_vid
+            app_dict["intro_video_url"] = norm_vid
+            res.append(ApplicationResponse(**app_dict))
+        return res
     
     @router.get("/stats")
     async def get_application_stats():
@@ -294,7 +435,11 @@ The Psychic Advisor Team
         application = await db.applications.find_one({"id": application_id})
         if not application:
             raise HTTPException(status_code=404, detail="Application not found")
-        return ApplicationResponse(**application)
+        app_dict = dict(application)
+        norm_vid = normalize_applicant_video_url(app_dict.get("video_url") or app_dict.get("intro_video_url"))
+        app_dict["video_url"] = norm_vid
+        app_dict["intro_video_url"] = norm_vid
+        return ApplicationResponse(**app_dict)
     
     @router.get("/check/{email}")
     async def check_application_status(email: str):
