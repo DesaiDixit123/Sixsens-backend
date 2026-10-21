@@ -263,13 +263,11 @@ def create_psychic_portal_routes(db):
                         d["earnings"] = round(d["earnings"] + t_amount, 2)
                         break
 
-        raw_weekly = round(sum(d["earnings"] for d in daily_breakdown), 2)
+        # Weekly = readings + tips in last 7 days (100% dynamic)
+        weekly_earnings = round(sum(d["earnings"] for d in daily_breakdown), 2)
+        total_withdrawn = float(psychic.get("total_withdrawn", 0) or 0)
         total_earnings = max(round(float(psychic.get("total_earnings", 0) or 0), 2), round(computed_lifetime, 2))
-        available_balance = max(round(float(psychic.get("available_balance", 0) or 0), 2), round(computed_lifetime, 2))
-        # Ensure weekly_earnings accurately reflects total period earnings (matching available balance if all is recent)
-        weekly_earnings = max(raw_weekly, available_balance) if (raw_weekly > 0 and raw_weekly < available_balance) else raw_weekly
-        if weekly_earnings == 0 and available_balance > 0:
-            weekly_earnings = available_balance
+        available_balance = max(round(float(psychic.get("available_balance", 0) or 0), 2), round(max(0.0, computed_lifetime - total_withdrawn), 2))
         total_readings = max(int(psychic.get("total_readings", 0) or 0), len(all_ended_sessions))
 
         dashboard = PsychicDashboard(

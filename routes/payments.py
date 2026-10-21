@@ -1548,7 +1548,13 @@ def create_payment_routes(db):
 
         # Query all ended sessions for lifetime computation if stored is 0
         all_sessions = await db.chat_sessions.find({"$or": query_or, "status": "ended"}).to_list(2000)
-        computed_lifetime = round(sum(calc_session_earning(s) for s in all_sessions), 2)
+        all_tips_lifetime = await db.tips.find({"$or": query_or}).to_list(2000)
+        # Lifetime = reading earnings (40%) + 100% of client tips (same formula as dashboard)
+        computed_lifetime = round(
+            sum(calc_session_earning(s) for s in all_sessions)
+            + sum(float(t.get("amount", 0) or 0) for t in all_tips_lifetime),
+            2,
+        )
 
         total_earnings = max(round(float(psychic.get("total_earnings", 0) or 0), 2), computed_lifetime)
         total_withdrawn = float(psychic.get("total_withdrawn", 0) or 0)
@@ -1633,9 +1639,6 @@ def create_payment_routes(db):
         period_tips = total_tips_period
         # Total net take-home to advisor including 100% of client tips
         period_total_net = round(period_reading_net + period_tips, 2)
-        if available > period_total_net and (timeframe in ("all", "7d", "month") or len(sessions) == 0):
-            period_total_net = available
-            period_tips = max(period_tips, round(available - period_reading_net, 2))
 
         return {
             "available_balance": available,
