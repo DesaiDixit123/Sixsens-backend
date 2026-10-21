@@ -1504,6 +1504,7 @@ def create_payment_routes(db):
                 psychic = {"id": psychic_id, "email": psychic_id if "@" in psychic_id else "advisor@sixthsense.com", "total_earnings": 0.0, "available_balance": 0.0}
 
         pid = psychic.get("id", psychic_id)
+        pemail = psychic.get("email")
 
         # Timeframe filter for period stats + transactions
         now = datetime.utcnow()
@@ -1647,7 +1648,8 @@ def create_payment_routes(db):
         if not psychic:
             psychic = await db.psychics.find_one({"email": psychic_id})
         psychic_name = psychic.get("name") if psychic else "Advisor"
-        pid = psychic.get("id", psychic_id) if psychic else psychic_id
+        pid = psychic.get("id", psychic_id)
+        pemail = psychic.get("email") if psychic else psychic_id
 
         amount_cents = int(round(raw_amount * 100))
         amount_dollars = round(amount_cents / 100.0, 2)
@@ -1737,7 +1739,8 @@ def create_payment_routes(db):
         psychic = await db.psychics.find_one({"id": psychic_id})
         if not psychic:
             psychic = await db.psychics.find_one({"email": psychic_id})
-        pid = psychic.get("id", psychic_id) if psychic else psychic_id
+        pid = psychic.get("id", psychic_id)
+        pemail = psychic.get("email") if psychic else psychic_id
         psychic_name = psychic.get("name") if psychic else "Advisor"
 
         if tip_amount > 0 and pid:
