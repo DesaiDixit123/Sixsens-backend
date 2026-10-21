@@ -1265,9 +1265,47 @@ def create_chat_routes(db):
                 "last_message_time": str(last_msg_time) if last_msg_time else None,
                 "total_duration": s.get("duration_seconds") or (int(s.get("total_minutes") or s.get("auto_end_minutes") or 1) * 60),
                 "total_cost": float(s.get("total_cost") or 0.0),
+                "notes": s.get("notes") or s.get("psychic_notes") or "",
+                "psychic_notes": s.get("psychic_notes") or s.get("notes") or "",
                 "status": "completed" if s.get("status") in ("ended", "completed") else "active",
                 "created_at": str(s.get("created_at") or s.get("started_at") or datetime.utcnow().isoformat()),
             })
         return result
-    
+
+    @router.post("/sessions/{session_id}/psychic-notes")
+    async def post_psychic_session_notes(session_id: str, data: dict):
+        """Save psychic notes for session"""
+        notes = data.get("notes", "")
+        est = data.get("client_satisfaction_estimate", 0)
+        now_iso = datetime.utcnow().isoformat()
+        update_data = {
+            "notes": notes,
+            "psychic_notes": notes,
+            "client_satisfaction_estimate": est,
+            "notes_updated_at": now_iso
+        }
+        await db.chat_sessions.update_one(
+            {"$or": [{"id": session_id}, {"_id": session_id}]},
+            {"$set": update_data}
+        )
+        await db.calls.update_one(
+            {"$or": [{"id": session_id}, {"_id": session_id}, {"call_id": session_id}]},
+            {"$set": update_data}
+        )
+        return {"success": True, "notes": notes, "session_id": session_id}
+
+    @router.get("/sessions/{session_id}/notes")
+    async def get_psychic_session_notes(session_id: str):
+        """Get psychic notes for session"""
+        sess = await db.chat_sessions.find_one({"$or": [{"id": session_id}, {"_id": session_id}]})
+        if sess and (sess.get("notes") or sess.get("psychic_notes")):
+            return {
+                "success": True,
+                "notes": sess.get("notes") or sess.get("psychic_notes"),
+                "psychic_notes": sess.get("psychic_notes") or sess.get("notes"),
+                "client_satisfaction_estimate": sess.get("client_satisfaction_estimate"),
+                "updated_at": sess.get("notes_updated_at")
+            }
+        return {"success": True, "notes": "", "psychic_notes": ""}
+
     return router

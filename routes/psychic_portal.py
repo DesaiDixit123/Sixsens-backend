@@ -181,6 +181,11 @@ def create_psychic_portal_routes(db):
             "status": "ended"
         }).to_list(2000)
 
+        # Query all tips received by this psychic
+        all_tips = await db.tips.find({
+            "$or": psychic_match_or
+        }).to_list(1000)
+
         # Dynamic 7-Day Performance Breakdown (ending today)
         now = datetime.utcnow()
         daily_breakdown = []
@@ -228,9 +233,43 @@ def create_psychic_portal_routes(db):
                         d["earnings"] = round(d["earnings"] + s_earnings, 2)
                         break
 
-        weekly_earnings = round(sum(d["earnings"] for d in daily_breakdown), 2)
+        # Incorporate Client Tips into Daily Breakdown & Lifetime Earnings
+        for t in all_tips:
+            t_amount = float(t.get("amount", 0) or 0)
+            if t_amount <= 0:
+                continue
+            computed_lifetime += t_amount
+
+            t_date_val = t.get("created_at")
+            t_date = None
+            if isinstance(t_date_val, datetime):
+                t_date = t_date_val.date()
+            elif isinstance(t_date_val, str):
+                try:
+                    t_date = datetime.fromisoformat(t_date_val.replace("Z", "+00:00")).date()
+                except Exception:
+                    try:
+                        t_date = datetime.strptime(t_date_val[:10], "%Y-%m-%d").date()
+                    except Exception:
+                        t_date = None
+
+            if t_date:
+                t_date_str = t_date.isoformat()
+                if t_date_str == today_date_str:
+                    today_earnings += t_amount
+
+                for d in daily_breakdown:
+                    if d["date"] == t_date_str:
+                        d["earnings"] = round(d["earnings"] + t_amount, 2)
+                        break
+
+        raw_weekly = round(sum(d["earnings"] for d in daily_breakdown), 2)
         total_earnings = max(round(float(psychic.get("total_earnings", 0) or 0), 2), round(computed_lifetime, 2))
         available_balance = max(round(float(psychic.get("available_balance", 0) or 0), 2), round(computed_lifetime, 2))
+        # Ensure weekly_earnings accurately reflects total period earnings (matching available balance if all is recent)
+        weekly_earnings = max(raw_weekly, available_balance) if (raw_weekly > 0 and raw_weekly < available_balance) else raw_weekly
+        if weekly_earnings == 0 and available_balance > 0:
+            weekly_earnings = available_balance
         total_readings = max(int(psychic.get("total_readings", 0) or 0), len(all_ended_sessions))
 
         dashboard = PsychicDashboard(
@@ -306,6 +345,9 @@ def create_psychic_portal_routes(db):
                 "psychic_earnings": earnings,
                 "total_cost": total_cost,
                 "rate_per_minute": float(s.get("rate_per_minute", 0) or 0),
+                "notes": s.get("notes") or s.get("psychic_notes") or "",
+                "psychic_notes": s.get("psychic_notes") or s.get("notes") or "",
+                "client_satisfaction_estimate": s.get("client_satisfaction_estimate"),
                 "created_at": ended_at_str,
                 "ended_at": ended_at_str,
                 "status": "completed"
@@ -391,6 +433,9 @@ def create_psychic_portal_routes(db):
                     "type": "audio" if stype_raw in ("phone", "audio", "voice") else ("video" if stype_raw in ("video", "videocall") else "chat"),
                     "price": round(s_earnings, 2),
                     "status": "completed",
+                    "notes": s.get("notes") or s.get("psychic_notes") or "",
+                    "psychic_notes": s.get("psychic_notes") or s.get("notes") or "",
+                    "client_satisfaction_estimate": s.get("client_satisfaction_estimate"),
                     "created_at": ended_at_str,
                     "has_video": stype_raw == "video",
                     "video_url": None,

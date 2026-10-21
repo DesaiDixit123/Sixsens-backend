@@ -611,6 +611,218 @@ async def send_scheduled_promotional_notifications():
         logger.error(f"❌ Error sending promotional notifications: {e}")
         return 0
 
+# ============ PSYCHIC SESSION NOTES & CLIENT HISTORY ENDPOINTS ============
+class PsychicNotesPayload(BaseModel):
+    psychic_id: Optional[str] = None
+    client_id: Optional[str] = None
+    notes: str
+    client_satisfaction_estimate: Optional[int] = 0
+
+@app.post("/api/sessions/{session_id}/psychic-notes")
+@app.post("/api/chat/sessions/{session_id}/psychic-notes")
+async def save_session_psychic_notes(session_id: str, payload: PsychicNotesPayload):
+    """Save psychic notes for completed chat, audio, or video session"""
+    now_iso = datetime.utcnow().isoformat()
+    update_data = {
+        "notes": payload.notes,
+        "psychic_notes": payload.notes,
+        "client_satisfaction_estimate": payload.client_satisfaction_estimate,
+        "notes_updated_at": now_iso
+    }
+
+    # 1. Update in chat_sessions
+    await db.chat_sessions.update_one(
+        {"$or": [{"id": session_id}, {"_id": session_id}]},
+        {"$set": update_data}
+    )
+
+    # 2. Update in calls (for audio/video calls)
+    await db.calls.update_one(
+        {"$or": [{"id": session_id}, {"_id": session_id}, {"call_id": session_id}]},
+        {"$set": update_data}
+    )
+
+    # 3. Store in session_notes collection
+    doc = {
+        "session_id": session_id,
+        "psychic_id": payload.psychic_id,
+        "client_id": payload.client_id,
+        "notes": payload.notes,
+        "client_satisfaction_estimate": payload.client_satisfaction_estimate,
+        "created_at": now_iso
+    }
+    await db.session_notes.update_one(
+        {"session_id": session_id},
+        {"$set": doc},
+        upsert=True
+    )
+
+    # 4. Notify client if client_id exists
+    if payload.client_id:
+        try:
+            from routes.websocket import expand_user_aliases
+            c_aliases = expand_user_aliases(payload.client_id)
+            for cid in c_aliases:
+                await db.notifications.insert_one({
+                    "user_id": cid,
+                    "title": "Advisor Session Notes",
+                    "message": "Your advisor added session notes and guidance from your reading!",
+                    "type": "reading_notes",
+                    "session_id": session_id,
+                    "is_read": False,
+                    "created_at": datetime.utcnow()
+                })
+        except Exception as e:
+            logger.error(f"Error creating client notes notification: {e}")
+
+    return {"success": True, "session_id": session_id, "notes": payload.notes}
+
+@app.get("/api/sessions/{session_id}/notes")
+@app.get("/api/chat/sessions/{session_id}/notes")
+async def get_session_psychic_notes(session_id: str):
+    """Retrieve session notes for both advisor and client view"""
+    # Check chat_sessions
+    sess = await db.chat_sessions.find_one({"$or": [{"id": session_id}, {"_id": session_id}]})
+    if sess and (sess.get("notes") or sess.get("psychic_notes")):
+        return {
+            "success": True,
+            "session_id": session_id,
+            "notes": sess.get("notes") or sess.get("psychic_notes"),
+            "psychic_notes": sess.get("psychic_notes") or sess.get("notes"),
+            "client_satisfaction_estimate": sess.get("client_satisfaction_estimate"),
+            "updated_at": sess.get("notes_updated_at")
+        }
+
+    # Check calls
+    call = await db.calls.find_one({"$or": [{"id": session_id}, {"_id": session_id}, {"call_id": session_id}]})
+    if call and (call.get("notes") or call.get("psychic_notes")):
+        return {
+            "success": True,
+            "session_id": session_id,
+            "notes": call.get("notes") or call.get("psychic_notes"),
+            "psychic_notes": call.get("psychic_notes") or call.get("notes"),
+            "client_satisfaction_estimate": call.get("client_satisfaction_estimate"),
+            "updated_at": call.get("notes_updated_at")
+        }
+
+    # Check session_notes collection
+    sn = await db.session_notes.find_one({"session_id": session_id})
+    if sn:
+        return {
+            "success": True,
+            "session_id": session_id,
+            "notes": sn.get("notes", ""),
+            "psychic_notes": sn.get("notes", ""),
+            "client_satisfaction_estimate": sn.get("client_satisfaction_estimate"),
+            "updated_at": sn.get("created_at")
+        }
+
+    return {"success": True, "session_id": session_id, "notes": "", "psychic_notes": ""}
+
+@app.get("/api/history/chats/{user_id}")
+async def get_history_chats(user_id: str, limit: int = 50):
+    from routes.websocket import expand_user_aliases
+    aliases = expand_user_aliases(user_id)
+    sessions = await db.chat_sessions.find({
+        "$or": [{"client_id": {"$in": aliases}}, {"client_id": user_id}],
+        "status": "ended"
+    }).sort("ended_at", -1).to_list(limit)
+
+    results = []
+    for s in sessions:
+        psy_id = s.get("psychic_id")
+        psy = await db.psychics.find_one({"id": {"$in": expand_user_aliases(psy_id)}}) if psy_id else None
+        
+        # Last message preview
+        msgs = s.get("messages", [])
+        last_msg = ""
+        if msgs:
+            last_msg = msgs[-1].get("message") or msgs[-1].get("content") or ""
+        if not last_msg:
+            db_msgs = await db.messages.find({"conversation_id": s.get("id")}).sort("created_at", -1).to_list(1)
+            if db_msgs:
+                last_msg = db_msgs[0].get("content") or ""
+
+        created = s.get("created_at") or s.get("started_at")
+        results.append({
+            "id": s.get("id") or str(s.get("_id")),
+            "psychic_id": psy_id or "",
+            "psychic_name": (psy.get("name") if psy else s.get("psychic_name")) or "Psychic Advisor",
+            "psychic_avatar": (psy.get("avatar") or psy.get("profile_picture") if psy else None) or "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150",
+            "last_message": last_msg or "Reading completed",
+            "duration": int(s.get("duration_seconds") or 0),
+            "cost": float(s.get("total_cost") or 0.0),
+            "notes": s.get("notes") or s.get("psychic_notes") or "",
+            "psychic_notes": s.get("psychic_notes") or s.get("notes") or "",
+            "created_at": created.isoformat() if isinstance(created, datetime) else str(created or "")
+        })
+    return results
+
+@app.get("/api/history/calls/{user_id}")
+async def get_history_calls(user_id: str, call_type: Optional[str] = None, limit: int = 50):
+    from routes.websocket import expand_user_aliases
+    aliases = expand_user_aliases(user_id)
+    
+    # Query ended sessions for phone or video
+    q = {
+        "$or": [{"client_id": {"$in": aliases}}, {"client_id": user_id}],
+        "status": "ended"
+    }
+    if call_type == "phone":
+        q["session_type"] = {"$in": ["phone", "audio", "voice"]}
+    elif call_type == "video":
+        q["session_type"] = {"$in": ["video", "videocall"]}
+
+    sessions = await db.chat_sessions.find(q).sort("ended_at", -1).to_list(limit)
+
+    results = []
+    for s in sessions:
+        psy_id = s.get("psychic_id")
+        psy = await db.psychics.find_one({"id": {"$in": expand_user_aliases(psy_id)}}) if psy_id else None
+        stype = (s.get("session_type") or "phone").lower()
+        created = s.get("created_at") or s.get("started_at")
+        results.append({
+            "id": s.get("id") or str(s.get("_id")),
+            "psychic_id": psy_id or "",
+            "psychic_name": (psy.get("name") if psy else s.get("psychic_name")) or "Psychic Advisor",
+            "psychic_avatar": (psy.get("avatar") or psy.get("profile_picture") if psy else None) or "https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=150",
+            "call_type": "video" if stype in ("video", "videocall") else "phone",
+            "duration": int(s.get("duration_seconds") or 0),
+            "cost": float(s.get("total_cost") or 0.0),
+            "recording_url": s.get("recording_url"),
+            "notes": s.get("notes") or s.get("psychic_notes") or "",
+            "psychic_notes": s.get("psychic_notes") or s.get("notes") or "",
+            "created_at": created.isoformat() if isinstance(created, datetime) else str(created or "")
+        })
+    return results
+
+@app.get("/api/history/recorded/{user_id}")
+async def get_history_recorded(user_id: str, limit: int = 50):
+    from routes.websocket import expand_user_aliases
+    aliases = expand_user_aliases(user_id)
+    questions = await db.questions.find({
+        "$or": [{"client_id": {"$in": aliases}}, {"client_id": user_id}],
+        "status": "completed"
+    }).sort("completed_at", -1).to_list(limit)
+
+    results = []
+    for q in questions:
+        psy_id = q.get("psychic_id")
+        psy = await db.psychics.find_one({"id": {"$in": expand_user_aliases(psy_id)}}) if psy_id else None
+        created = q.get("completed_at") or q.get("created_at")
+        results.append({
+            "id": q.get("id") or str(q.get("_id")),
+            "psychic_id": psy_id or "",
+            "psychic_name": (psy.get("name") if psy else q.get("psychic_name")) or "Psychic Advisor",
+            "psychic_avatar": (psy.get("avatar") or psy.get("profile_picture") if psy else None),
+            "question": q.get("question") or q.get("question_text") or "",
+            "duration": int(q.get("duration_seconds") or 180),
+            "cost": float(q.get("price") or q.get("amount") or 12.0),
+            "video_url": q.get("video_response_url") or "",
+            "created_at": created.isoformat() if isinstance(created, datetime) else str(created or "")
+        })
+    return results
+
 # Initialize scheduler
 scheduler = AsyncIOScheduler()
 

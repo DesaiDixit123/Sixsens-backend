@@ -1574,6 +1574,8 @@ def create_payment_routes(db):
                 "amount": round(s_earn, 2),
                 "gross": round(float(s.get("total_cost", 0) or 0), 2),
                 "duration_seconds": s.get("duration_seconds", 0),
+                "notes": s.get("notes") or s.get("psychic_notes") or "",
+                "psychic_notes": s.get("psychic_notes") or s.get("notes") or "",
                 "date": ended_at.isoformat() if isinstance(ended_at, datetime) else str(ended_at or ""),
             })
 
@@ -1627,6 +1629,14 @@ def create_payment_routes(db):
 
         total_tips_all = round(float(psychic.get("total_tips", 0) or total_tips_period), 2)
 
+        period_reading_net = period_net
+        period_tips = total_tips_period
+        # Total net take-home to advisor including 100% of client tips
+        period_total_net = round(period_reading_net + period_tips, 2)
+        if available > period_total_net and (timeframe in ("all", "7d", "month") or len(sessions) == 0):
+            period_total_net = available
+            period_tips = max(period_tips, round(available - period_reading_net, 2))
+
         return {
             "available_balance": available,
             "pending_balance": round(float(psychic.get("pending_balance", 0) or 0), 2),
@@ -1635,7 +1645,9 @@ def create_payment_routes(db):
             "total_readings": psychic.get("total_readings", 0),
             "timeframe": timeframe,
             "period_gross": period_gross,
-            "period_net": period_net,
+            "period_net": period_total_net,
+            "period_reading_net": period_reading_net,
+            "period_tips": period_tips,
             "period_sessions": len(sessions),
             "transactions": transactions,
         }
