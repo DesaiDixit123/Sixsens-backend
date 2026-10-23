@@ -952,6 +952,12 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
             user_dict["password_hash"] = None
             await db.users.insert_one(user_dict)
             
+            # Send welcome email asynchronously for new Google sign-ups
+            try:
+                background_tasks.add_task(send_welcome_email_async, user.email, user.name)
+            except Exception as e:
+                print(f"Failed to queue welcome email for Google sign-up: {e}")
+            
             token = create_access_token({"user_id": user.id, "email": user.email})
             
             return TokenResponse(
@@ -960,9 +966,9 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
             )
     
     @router.post("/google")
-    async def google_auth_direct(data: dict):
+    async def google_auth_direct(data: dict, background_tasks: BackgroundTasks):
         """
-        Authenticate user with Google OAuth data (from expo-auth-session).
+        Authenticate user with Google OAuth data (from native Google Sign-In or expo-auth-session).
         This endpoint receives Google user info directly from the mobile app.
         """
         google_id = data.get("google_id")
@@ -1033,6 +1039,12 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
             # No password hash for social auth users
             user_dict["password_hash"] = None
             await db.users.insert_one(user_dict)
+            
+            # Send welcome email asynchronously for new Google sign-ups
+            try:
+                background_tasks.add_task(send_welcome_email_async, user.email, user.name)
+            except Exception as e:
+                print(f"Failed to queue welcome email for Google sign-up: {e}")
             
             token = create_access_token({"user_id": user.id, "email": user.email})
             user_resp = UserResponse(**user.dict())
