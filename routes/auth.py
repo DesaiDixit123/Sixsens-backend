@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Request
 from datetime import datetime, timedelta, timezone
 import jwt
 import bcrypt
@@ -1069,205 +1069,31 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
             )
 
     @router.get("/google/authorize")
-    async def google_oauth_authorize(session_id: str = "", app_return_url: str = ""):
-        """Mobile-friendly Dynamic Google OAuth Sign-In."""
-        from fastapi.responses import HTMLResponse
+    async def google_oauth_authorize(request: Request, session_id: str = "", app_return_url: str = ""):
+        """Real Google OAuth 2.0 Sign-In redirect to accounts.google.com."""
+        from fastapi.responses import RedirectResponse
+        import urllib.parse
 
         sid = session_id or f"gsess_{uuid.uuid4().hex[:16]}"
-        close_url = app_return_url or "exp://192.168.29.227:8081"
+        ret_url = app_return_url or "exp://192.168.29.227:8081"
+        state = f"{sid}___{urllib.parse.quote(ret_url)}"
 
-        html = f"""
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-            <title>Sign in with Google - Sixth Sense</title>
-            <style>
-                * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Google Sans", "Segoe UI", Roboto, sans-serif; -webkit-tap-highlight-color: transparent; }}
-                body {{
-                    background: #131314;
-                    color: #e3e3e3;
-                    min-height: 100vh;
-                    display: flex;
-                    flex-direction: column;
-                    justify-content: flex-end;
-                    padding: 0;
-                }}
-                .backdrop {{
-                    flex: 1;
-                    width: 100%;
-                }}
-                .sheet {{
-                    background: #1f1f20;
-                    border-top-left-radius: 28px;
-                    border-top-right-radius: 28px;
-                    width: 100%;
-                    max-width: 480px;
-                    margin: 0 auto;
-                    padding: 20px 22px 36px;
-                    box-shadow: 0 -8px 32px rgba(0,0,0,0.6);
-                    display: flex;
-                    flex-direction: column;
-                }}
-                .drag-handle {{
-                    width: 40px;
-                    height: 4px;
-                    background: #444746;
-                    border-radius: 2px;
-                    margin: 0 auto 16px;
-                }}
-                .top-bar {{
-                    display: flex;
-                    align-items: center;
-                    justify-content: space-between;
-                    margin-bottom: 16px;
-                }}
-                .g-logo {{
-                    display: flex;
-                    align-items: center;
-                    gap: 10px;
-                    font-size: 19px;
-                    font-weight: 500;
-                    color: #e3e3e3;
-                }}
-                .g-logo svg {{ width: 24px; height: 24px; }}
-                .close-btn {{
-                    width: 32px;
-                    height: 32px;
-                    border-radius: 16px;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    color: #c4c7c5;
-                    font-size: 20px;
-                    text-decoration: none;
-                    background: rgba(255,255,255,0.06);
-                }}
-                .sheet-header {{
-                    margin-bottom: 22px;
-                }}
-                .sheet-title {{
-                    font-size: 22px;
-                    font-weight: 500;
-                    color: #f1f3f4;
-                    margin-bottom: 4px;
-                }}
-                .sheet-sub {{
-                    font-size: 14px;
-                    color: #9aa0a6;
-                }}
-                .sheet-sub strong {{
-                    color: #c4c7c5;
-                }}
-                
-                .form-box {{
-                    display: flex;
-                    flex-direction: column;
-                    gap: 14px;
-                }}
-                .field-group {{
-                    display: flex;
-                    flex-direction: column;
-                    gap: 6px;
-                }}
-                .field-label {{
-                    font-size: 13px;
-                    font-weight: 500;
-                    color: #c4c7c5;
-                }}
-                .input {{
-                    width: 100%;
-                    padding: 14px 16px;
-                    background: #28292c;
-                    border: 1px solid #444746;
-                    border-radius: 12px;
-                    font-size: 15px;
-                    color: #f1f3f4;
-                    outline: none;
-                    transition: border-color 0.2s;
-                }}
-                .input:focus {{
-                    border-color: #8ab4f8;
-                }}
-                .submit-btn {{
-                    width: 100%;
-                    background: #1a73e8;
-                    color: #fff;
-                    border: none;
-                    border-radius: 12px;
-                    padding: 15px;
-                    font-size: 16px;
-                    font-weight: 600;
-                    cursor: pointer;
-                    margin-top: 6px;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    gap: 10px;
-                    transition: background 0.2s;
-                }}
-                .submit-btn:active {{ background: #1557b0; }}
-                
-                .footer-note {{
-                    margin-top: 18px;
-                    padding-top: 12px;
-                    font-size: 11.5px;
-                    color: #8e918f;
-                    text-align: center;
-                    line-height: 1.4;
-                    border-top: 1px solid rgba(255,255,255,0.06);
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="backdrop" onclick="window.location.href='{close_url}'"></div>
-            <div class="sheet">
-                <div class="drag-handle"></div>
-                
-                <div class="top-bar">
-                    <div class="g-logo">
-                        <svg viewBox="0 0 24 24">
-                            <path fill="#4285F4" d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.8-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17z"/>
-                            <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.15C3.26 21.36 7.33 24 12 24z"/>
-                            <path fill="#FBBC05" d="M5.28 14.27c-.25-.72-.38-1.49-.38-2.27s.13-1.55.38-2.27V6.58H1.25C.45 8.18 0 9.98 0 12s.45 3.82 1.25 5.42l4.03-3.15z"/>
-                            <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.33 0 3.26 2.64 1.25 6.58l4.03 3.15c.95-2.83 3.6-4.98 6.72-4.98z"/>
-                        </svg>
-                        Google
-                    </div>
-                    <a class="close-btn" href="{close_url}">✕</a>
-                </div>
+        base = str(request.base_url).rstrip("/")
+        callback_url = f"{base}/api/auth/google/callback"
 
-                <div class="sheet-header">
-                    <div class="sheet-title">Sign in with Google</div>
-                    <div class="sheet-sub">to continue to <strong>Sixth Sense Psychics</strong></div>
-                </div>
+        google_client_id = "512681929226-37j50jbk2jvu09picvht72uhhdif2dut.apps.googleusercontent.com"
 
-                <form class="form-box" action="/api/auth/google/callback" method="get">
-                    <input type="hidden" name="session_id" value="{sid}" />
-                    <input type="hidden" name="app_return_url" value="{app_return_url or ''}" />
-                    <div class="field-group">
-                        <label class="field-label">Full Name</label>
-                        <input class="input" type="text" name="name" placeholder="Enter your full name" required autofocus />
-                    </div>
-                    <div class="field-group">
-                        <label class="field-label">Gmail / Google Email</label>
-                        <input class="input" type="email" name="email" placeholder="example@gmail.com" required />
-                    </div>
-                    <button type="submit" class="submit-btn">
-                        <span>Continue with Google</span>
-                        <span>›</span>
-                    </button>
-                </form>
+        params = {
+            "client_id": google_client_id,
+            "redirect_uri": callback_url,
+            "response_type": "token",
+            "scope": "openid email profile",
+            "state": state,
+            "prompt": "select_account"
+        }
 
-                <div class="footer-note">
-                    🔒 Connected to Firebase & Sixth Sense Psychics.<br>Your wallet credits, readings, and notifications sync automatically.
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-        return HTMLResponse(content=html)
+        google_auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urllib.parse.urlencode(params)}"
+        return RedirectResponse(url=google_auth_url, status_code=302)
 
     @router.get("/google/callback")
     async def google_oauth_callback(
