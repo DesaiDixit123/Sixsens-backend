@@ -1281,7 +1281,7 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
         }
     
     @router.post("/apple/verify")
-    async def apple_auth_verify(data: dict):
+    async def apple_auth_verify(data: dict, background_tasks: BackgroundTasks):
         """
         Verify Apple Sign-In identity token and create/login user.
         Called by iOS app after Apple authentication.
@@ -1351,6 +1351,9 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
             user_dict["password_hash"] = None
             await db.users.insert_one(user_dict)
             
+            if user.email and not user.email.endswith("@privaterelay.appleid.com"):
+                background_tasks.add_task(send_welcome_email_async, user.email, user.name)
+            
             token = create_access_token({"user_id": user.id, "email": user.email})
             
             return TokenResponse(
@@ -1364,6 +1367,13 @@ def create_auth_routes(db: AsyncIOMotorDatabase):
 # =============================================================================
 # Apple Token Verification Helper
 # =============================================================================
+
+APPLE_PUBLIC_KEYS_URL = "https://appleid.apple.com/auth/keys"
+APPLE_AUTH_URL = "https://appleid.apple.com"
+APPLE_BUNDLE_ID = os.getenv("APPLE_CLIENT_ID", "com.sixthsense.psychics")
+APPLE_SERVICES_ID = os.getenv("APPLE_SERVICES_ID", "com.sixthsense.psychics.service")
+APPLE_TEAM_ID = os.getenv("APPLE_TEAM_ID", "47D38HJ8KM")
+APPLE_KEY_ID = os.getenv("APPLE_KEY_ID", "2Y676LCMJK")
 
 _apple_public_keys = {}
 
@@ -1419,7 +1429,7 @@ async def verify_apple_token(identity_token: str) -> dict:
             identity_token,
             public_key,
             algorithms=["RS256"],
-            audience=APPLE_BUNDLE_ID,
+            audience=[APPLE_BUNDLE_ID, APPLE_SERVICES_ID],
             issuer=APPLE_AUTH_URL,
         )
         
@@ -1495,4 +1505,123 @@ def jwk_to_pem(jwk: dict) -> str:
             
             return {"success": True, "message": "Account deleted successfully"}
         except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to delete account: {str(e)}")
+
+    # Permanent Account Deletion for Psychic Advisors (Apple App Store Guideline 5.1.1(v))
+    @router.delete("/psychic/delete")
+    @router.delete("/account/delete")
+    async def delete_psychic_account(request: dict = None, authorization: Optional[str] = Header(None)):
+        """
+        Permanently delete an advisor/psychic account and scrub personally identifiable data
+        in compliance with Apple App Store Review Guideline 5.1.1(v).
+        """
+        psychic_id = None
+        email = None
+
+        # 1. Try bearer token first
+        if authorization and authorization.startswith("Bearer "):
+            token = authorization.split(" ")[1]
+            try:
+                payload = verify_token(token)
+                psychic_id = payload.get("user_id")
+                email = payload.get("email")
+            except Exception:
+                pass
+
+        # 2. Fallback to request payload
+        if request:
+            if not psychic_id:
+                psychic_id = request.get("psychic_id") or request.get("user_id")
+            if not email:
+                email = request.get("email")
+
+        if not psychic_id and not email:
+            raise HTTPException(status_code=400, detail="Authentication token or user identification required")
+
+        # 3. Locate the advisor record
+        query = {"$or": []}
+        if psychic_id:
+            query["$or"].append({"id": psychic_id})
+            query["$or"].append({"_id": psychic_id})
+        if email:
+            query["$or"].append({"email": email.lower()})
+
+        advisor_doc = await db.psychics.find_one(query)
+        target_id = advisor_doc.get("id") if advisor_doc else psychic_id
+        target_email = (advisor_doc.get("email") if advisor_doc else email or "").lower()
+
+        try:
+            # 4. Remove advisor push tokens & device bindings
+            await db.device_tokens.delete_many({
+                "$or": [
+                    {"user_id": target_id},
+                    {"user_id": target_email},
+                    {"email": target_email}
+                ]
+            })
+
+            # 5. Remove advisor settings & notifications
+            await db.psychic_settings.delete_many({
+                "$or": [{"psychic_id": target_id}, {"email": target_email}]
+            })
+            await db.notifications.delete_many({
+                "$or": [{"user_id": target_id}, {"user_id": target_email}]
+            })
+
+            # 6. Remove favorites referencing this advisor
+            if target_id:
+                await db.favorites.delete_many({"psychic_id": target_id})
+
+            # 7. Cancel pending session requests
+            if target_id:
+                await db.session_requests.delete_many({
+                    "psychic_id": target_id,
+                    "status": "pending"
+                })
+
+            # 8. Clean up uploaded videos/intros
+            await db.advisor_videos.delete_many({
+                "$or": [{"psychic_id": target_id}, {"email": target_email}]
+            })
+
+            # 9. Anonymize chat message sender display to preserve client reading history without advisor PII
+            if target_id:
+                await db.messages.update_many(
+                    {"sender_id": target_id},
+                    {"$set": {"sender_name": "Former Advisor", "is_sender_deleted": True}}
+                )
+
+            # 10. Record in deleted_psychics archive to prevent re-listing or unauthorized reactivation
+            if target_id:
+                await db.deleted_psychics.update_one(
+                    {"_id": "deleted_ids"},
+                    {"$addToSet": {"ids": target_id}},
+                    upsert=True
+                )
+                try:
+                    from routes.psychics import DELETED_PSYCHIC_IDS, MOCK_PSYCHICS
+                    DELETED_PSYCHIC_IDS.add(target_id)
+                    # Remove from in-memory mock if present
+                    for idx, mp in enumerate(list(MOCK_PSYCHICS)):
+                        if mp.get("id") == target_id or mp.get("email") == target_email:
+                            MOCK_PSYCHICS.pop(idx)
+                            break
+                except Exception as sync_err:
+                    print(f"Sync error during deletion: {sync_err}")
+
+            # 11. Delete the primary advisor document
+            await db.psychics.delete_many(query)
+
+            # Also check if there's a corresponding application or user entry
+            if target_email:
+                await db.applications.delete_many({"email": target_email})
+                await db.psychic_applications.delete_many({"email": target_email})
+                await db.users.delete_many({"email": target_email, "role": "psychic"})
+
+            return {
+                "success": True,
+                "message": "Your account has been successfully deleted."
+            }
+        except Exception as e:
+            print(f"Error during account deletion: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to delete account: {str(e)}")

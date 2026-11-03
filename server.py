@@ -471,6 +471,87 @@ app.include_router(recorded_video_router, prefix="/api")
 app.include_router(recorded_readings_router, prefix="/api")
 app.include_router(stripe_connect_router, prefix="/api")
 
+# Apple Guideline 5.1.1(v) - Unified Account Deletion Endpoint
+@app.delete("/api/v1/account/delete")
+async def delete_account_v1(request: Request, authorization: Optional[str] = Header(None)):
+    """
+    Direct alias endpoint for Apple App Store Account Deletion Guideline 5.1.1(v).
+    Accepts Bearer token or JSON payload identifying user or psychic advisor.
+    """
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    
+    # Try psychic deletion first if role is psychic or psychic credentials provided
+    role = body.get("role", "")
+    user_id = body.get("user_id") or body.get("psychic_id")
+    email = body.get("email")
+
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split(" ")[1]
+        try:
+            from routes.auth import verify_token
+            payload = verify_token(token)
+            role = payload.get("role", role)
+            user_id = payload.get("user_id", user_id)
+            email = payload.get("email", email)
+        except Exception:
+            pass
+
+    # If it's a psychic/advisor or exists in psychics collection
+    is_psychic = role == "psychic"
+    if not is_psychic and (user_id or email):
+        query = {"$or": []}
+        if user_id:
+            query["$or"].extend([{"id": user_id}, {"_id": user_id}])
+        if email:
+            query["$or"].append({"email": email.lower()})
+        if query["$or"]:
+            found = await db.psychics.find_one(query)
+            if found:
+                is_psychic = True
+
+    if is_psychic:
+        # Perform advisor cleanup
+        query = {"$or": []}
+        if user_id:
+            query["$or"].extend([{"id": user_id}, {"_id": user_id}])
+        if email:
+            query["$or"].append({"email": email.lower()})
+        
+        await db.device_tokens.delete_many({"$or": [{"user_id": user_id}, {"user_id": email}, {"email": email}]})
+        await db.psychic_settings.delete_many({"$or": [{"psychic_id": user_id}, {"email": email}]})
+        await db.notifications.delete_many({"$or": [{"user_id": user_id}, {"user_id": email}]})
+        if user_id:
+            await db.favorites.delete_many({"psychic_id": user_id})
+            await db.session_requests.delete_many({"psychic_id": user_id, "status": "pending"})
+            await db.deleted_psychics.update_one({"_id": "deleted_ids"}, {"$addToSet": {"ids": user_id}}, upsert=True)
+            try:
+                from routes.psychics import DELETED_PSYCHIC_IDS
+                DELETED_PSYCHIC_IDS.add(user_id)
+            except Exception:
+                pass
+        await db.psychics.delete_many(query)
+        if email:
+            await db.applications.delete_many({"email": email.lower()})
+            await db.psychic_applications.delete_many({"email": email.lower()})
+            await db.users.delete_many({"email": email.lower(), "role": "psychic"})
+        
+        return {"success": True, "message": "Your account has been successfully deleted."}
+    else:
+        # Client user cleanup
+        if user_id:
+            await db.messages.delete_many({"$or": [{"sender_id": user_id}, {"receiver_id": user_id}]})
+            await db.conversations.delete_many({"participants": user_id})
+            await db.reviews.delete_many({"user_id": user_id})
+            await db.payments.delete_many({"user_id": user_id})
+            await db.sessions.delete_many({"user_id": user_id})
+            await db.notifications.delete_many({"user_id": user_id})
+            await db.users.delete_one({"id": user_id})
+        return {"success": True, "message": "Your account has been successfully deleted."}
+
 # Configured explicit CORS allowed origins (BE-003, AUD-038)
 ALLOWED_ORIGINS = [
     origin.strip() for origin in os.getenv(
